@@ -3,21 +3,21 @@ from numpy import ndarray # Just numpy's version of a list. it supports matricie
 
 @dataclass
 class MotionVector: # (read here for information about what element in the array means (it is documented) https://github.com/LukasBommes/mv-extractor)
-    source : int
-    width : int
-    height : int
-    source_x : int
-    source_y : int
-    destination_x : int
-    destination_y : int
-    motion_x : int
-    motion_y : int
-    motion_scale : int
-    
+    source      : int   # reference frame offset (e.g. -1 = previous frame)
+    width       : int   # macroblock width  (pixels)
+    height      : int   # macroblock height (pixels)
+    source_x    : int   # source macroblock top-left x
+    source_y    : int   # source macroblock top-left y
+    destination_x : int # destination macroblock top-left x
+    destination_y : int # destination macroblock top-left y
+    motion_x    : int   # raw MV x component (in 1/motion_scale px)
+    motion_y    : int   # raw MV y component (in 1/motion_scale px)
+    motion_scale: int   # sub-pixel precision (e.g. 2 = half-pixel)
+
 @dataclass
 class Frame:
     motion_vectors : list[MotionVector]
     frame_type : str # Frametype (I = Keyframe, P = frame that only referes to past frames, B = frame that referes to both past and future frames. ? = unkown frame type)
-    residuals : ndarray
-    true_bounding_boxes : list[list[float]]
-    true_classes : list[int]
+    residuals         : ndarray      # H x W x 3  uint8
+    true_bounding_boxes : list[list[float]]  # [[cx, cy, w, h], …]  normalised
+    true_classes      : list[int]    # one label per box

@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from numpy import ndarray
+from dataclasses import dataclass # Dataclass adds a few functions to the class autiomatically, like an __init__() dfunction that automatically has all the variables defined as arguments
+from numpy import ndarray # Just numpy's version of a list. it supports matricies as well
 
 @dataclass
 class MotionVector: # (read here for information about what element in the array means (it is documented) https://github.com/LukasBommes/mv-extractor)

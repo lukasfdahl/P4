@@ -25,7 +25,7 @@ MAX_BOXES_PER_FRAME = 5
 NUM_CLASSES = 10 #dependent on dataset, 100 i think?
 
 # Number of MV entries per frame (variable in reality – we treat it as a flat
-# feature vector here; adjust if you want to keep it as a sequence)
+# feature vector here)
 MV_PER_FRAME = 16
 
 random.seed(SEED)

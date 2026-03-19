@@ -19,5 +19,5 @@ class Frame:
     motion_vectors : list[MotionVector]
     frame_type : str # Frametype (I = Keyframe, P = frame that only referes to past frames, B = frame that referes to both past and future frames. ? = unkown frame type)
     residuals         : ndarray      # H x W x 3  uint8
-    true_bounding_boxes : list[list[float]]  # [[cx, cy, w, h], …]  normalised
-    true_classes      : list[int]    # one label per box
+    true_bounding_boxes : list[float]  # [xmin, xmax]  normalised to [0, 1]
+    true_class          : int          # single class label per frame

@@ -4,7 +4,6 @@ import random
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
 from dataclasses import asdict
 
 from data_classes import Frame, MotionVector
@@ -21,7 +20,6 @@ TEST_RATIO  = 0.1
 
 # Frame / residual dimensions (H x W x C), change later?
 FRAME_H, FRAME_W = 64, 64
-MAX_BOXES_PER_FRAME = 5
 NUM_CLASSES = 10 #dependent on dataset, 100 i think?
 
 # Number of MV entries per frame (variable in reality – we treat it as a flat
@@ -49,20 +47,17 @@ def _random_motion_vector() -> MotionVector:
 
 
 def _random_frame() -> Frame:
-    num_boxes = random.randint(1, MAX_BOXES_PER_FRAME)
-
-    # BBoxes in [cx, cy, w, h] normalised to [0, 1]
-    bboxes = [
-        [round(random.uniform(0.1, 0.9), 4) for _ in range(4)]
-        for _ in range(num_boxes)
-    ]
-    classes = [random.randint(0, NUM_CLASSES - 1) for _ in range(num_boxes)]
+    # Single bbox per frame as [xmin, xmax] normalised to [0, 1]
+    xmin = round(random.uniform(0.0, 0.8), 4)
+    xmax = round(random.uniform(xmin, 1.0), 4)
+    bbox = [xmin, xmax]
+    true_class = random.randint(0, NUM_CLASSES - 1)
     return Frame(
         motion_vectors=[_random_motion_vector() for _ in range(MV_PER_FRAME)],
         frame_type=random.choice(["I", "P", "B"]),
         residuals=np.random.randint(0, 256, (FRAME_H, FRAME_W, 3), dtype=np.uint8),
-        true_bounding_boxes=bboxes,
-        true_classes=classes,
+        true_bounding_boxes=bbox,
+        true_class=true_class,
     )
 
 
@@ -109,33 +104,31 @@ class VideoFrameDataset(Dataset):
             frame.residuals.astype(np.float32) / 255.0
         ).permute(2, 0, 1)
 
-        #bbox gturth
+        #bbox ground truth → (2,) float tensor [xmin, xmax]
         boxes = torch.tensor(frame.true_bounding_boxes, dtype=torch.float32)
 
-        # data classes
-        classes = torch.tensor(frame.true_classes, dtype=torch.long)
+        # single class label per frame
+        true_class = torch.tensor(frame.true_class, dtype=torch.long)
 
         return {
             "motion_vectors": motion_vectors,   # (N_mv, 10)
             "frame_type":     frame_type,        # scalar
             "residuals":      residuals,          # (3, H, W)
-            "boxes":          boxes,              # (N_obj, 4)  – variable N
-            "classes":        classes,            # (N_obj,)    – variable N
+            "boxes":          boxes,              # (2,) – [xmin, xmax]
+            "true_class":     true_class,         # scalar
         }
 
 
 # arrrange items in order
 def collate_fn(batch: list[dict]) -> dict:
-    #Stacks fixed-size tensors normally; pads variable-length ones.
+    #Stacks fixed-size tensors normally; boxes are now fixed (2,) so no padding needed.
 
     return {
         "motion_vectors": torch.stack([s["motion_vectors"] for s in batch]),
         "frame_type":     torch.stack([s["frame_type"]     for s in batch]),
         "residuals":      torch.stack([s["residuals"]      for s in batch]),
-        # pad_sequence expects list of (N_i, ...) tensors
-        "boxes":    pad_sequence([s["boxes"]   for s in batch], batch_first=True),
-        "classes":  pad_sequence([s["classes"] for s in batch], batch_first=True),
-        "box_counts": torch.tensor([s["boxes"].shape[0] for s in batch]),
+        "boxes":          torch.stack([s["boxes"]          for s in batch]),  # (B, 2)
+        "true_class":     torch.stack([s["true_class"]     for s in batch]),  # (B,)
     }
 
 
@@ -201,7 +194,7 @@ if __name__ == "__main__":
     print()
     decoded = [['I','P','B','?'][v] for v in batch['frame_type'].tolist()]
     print(f"  frame_types  (decoded) : {decoded}")
-    print(f"  objects per frame      : {batch['box_counts'].tolist()}")
+    print(f"  objects per frame      : {batch['true_class'].tolist()}")
     print()
 
     # test few times

@@ -1,9 +1,3 @@
-This is it—the final, data-hungry version of the script. It is designed to find the video, bypass the naming confusion, and spit out the exact data shapes you’ve been fighting for all night.
-The "Data Extractor" Smoke Test (smoke_test.py)
-
-Put this in your Root Folder (P4).
-Python
-
 import cv_reader
 import os
 import sys

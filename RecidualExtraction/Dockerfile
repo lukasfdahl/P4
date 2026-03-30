@@ -19,8 +19,8 @@ WORKDIR /app/Compressed-Video-Reader-main
 RUN bash install.sh
 
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
-RUN pip install "numpy<2.0.0" pkgconfig cython
-RUN pip install --no-cache-dir --no-build-isolation .
+RUN pip install --no-cache-dir "numpy<2.0.0" pkgconfig flow-vis opencv-python
+RUN pip install --no-cache-dir --no-build-isolation --no-deps .
 
 ENV PKG_CONFIG_PATH="/app/Compressed-Video-Reader-main/ffmpeg/lib/pkgconfig"
 ENV LD_LIBRARY_PATH="/app/Compressed-Video-Reader-main/ffmpeg/lib"

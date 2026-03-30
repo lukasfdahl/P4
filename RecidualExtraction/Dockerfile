@@ -6,6 +6,9 @@ RUN apt-get update && apt-get install -y \
     yasm \
     pkg-config \
     cmake \
+    wget \
+    sudo \
+    bzip2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -17,7 +20,7 @@ RUN bash install.sh
 RUN pip install --no-cache-dir .
 
 ENV PKG_CONFIG_PATH="/app/Compressed-Video-Reader-main/ffmpeg/lib/pkgconfig"
-ENV LD_LIBRARY_PATH="/app/Compressed-Video-Reader-main/ffmpeg/lib:${LD_LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="/app/Compressed-Video-Reader-main/ffmpeg/lib"
 
 WORKDIR /app
 

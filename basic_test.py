@@ -8,9 +8,7 @@ video_path = "test_video.mp4"
 print("--- RECOVERY SMOKE TEST ---")
 
 try:
-    # 1. Check if the module actually loads (the NumPy/FFmpeg link check)
-    print(f"Checking cv_reader version: {cv_reader.__version__}")
-    
+
     if os.path.exists(video_path):
         # 2. Try to initialize the reader
         cap = cv_reader.VideoCapture(video_path)

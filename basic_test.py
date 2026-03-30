@@ -12,33 +12,36 @@ try:
         print(f"FAIL: Can't find video at {video_path}")
         exit(1)
 
-    # 1. Use the read_video function
     print("Decoding video...")
     all_frames = cv_reader.read_video(video_path)
     
     if all_frames and len(all_frames) > 0:
         print(f"Successfully decoded {len(all_frames)} frames!")
         
-        # 2. THE FLEXIBLE UNPACK
-        # This takes the first 3 items and puts everything else into 'extra'
-        # Researcher format is usually: (Type, Data, MotionVectors, ...rest)
-        first_frame = all_frames[0]
-        
-        # We grab the first 3 elements and ignore the rest
-        f_type, data, mv, *extra = first_frame
+        # 1. Grab the first dictionary
+        f = all_frames[0]
         
         print("\n" + "💎" * 15)
         print("  THE DATA IS REAL!")
         print("💎" * 15)
-        print(f"📄 Frame Type:    {f_type}")
-        print(f"🖼️  Data Shape:    {data.shape} (Residual/Frame)")
         
+        # 2. Pull data using the keys we found in the diagnostic
+        # We'll use .get() to be safe
+        print(f"📄 Frame Type:    {f.get('type', 'N/A')}")
+        print(f"📐 Dimensions:    {f.get('width')}x{f.get('height')}")
+        
+        # The actual image/residual data is usually under 'data' or 'residual'
+        data = f.get('data')
+        if data is not None:
+            print(f"🖼️  Data Shape:    {data.shape} (Residual/Frame)")
+        
+        # Motion vectors are usually 'mv'
+        mv = f.get('mv')
         if mv is not None:
             print(f"🏎️  Motion Vectors: {mv.shape}")
         else:
-            print("🏎️  Motion Vectors: None (I-Frame)")
+            print("🏎️  Motion Vectors: None")
             
-        print(f"🎁 Extra Info:    {len(extra)} other hidden fields found")
         print("💎" * 15)
         
     else:
@@ -46,6 +49,5 @@ try:
 
 except Exception as e:
     print(f"CRITICAL ERROR: {e}")
-    # Final fallback: just tell us what the first frame actually IS
     if 'all_frames' in locals() and len(all_frames) > 0:
-        print(f"Raw data structure of frame 0: {type(all_frames[0])} with length {len(all_frames[0])}")
+        print(f"Dictionary Keys available: {list(all_frames[0].keys())}")

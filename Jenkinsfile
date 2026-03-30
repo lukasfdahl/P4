@@ -25,7 +25,7 @@ pipeline {
         stage("Run Basic Test") {
             steps {
                 echo "Running basic test to see if library is working:"
-                sh "docker run --rm -v $(pwd):/app/test video-extractor-container:${env.BUILD_ID} python3 /app/test/basic_test.py"
+                sh "docker run --rm -v ${WORKSPACE}:/app/test video-extractor-container:${env.BUILD_ID} python3 /app/test/RecidualExtraction/basic_test.py"
             }
         }
     }

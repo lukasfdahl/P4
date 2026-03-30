@@ -1,5 +1,4 @@
 import cv_reader
-import cv_reader.api # Specifically load the C++ engine
 import os
 
 # Path Setup
@@ -9,36 +8,41 @@ video_path = os.path.join(script_dir, "test_video.mp4")
 print("--- THE FINAL RESIDUAL HUNT ---")
 
 try:
-    # 1. Try to find the class in the 'api' sub-module
-    # Your log showed 'api' is available. That is where the C++ VideoCapture lives.
-    if hasattr(cv_reader.api, 'VideoCapture'):
-        print("Success: Found 'VideoCapture' inside the api module.")
-        cap = cv_reader.api.VideoCapture(video_path)
-    elif hasattr(cv_reader, 'read_video'):
-        print("Success: Found 'read_video' function.")
-        # Some versions use a function that returns a generator
-        # We will try to get the first frame from it
-        reader = cv_reader.read_video(video_path)
-        valid, frame, mv, res = next(reader)
-    else:
-        print(f"FAIL: Still can't find the entry point. Attributes: {dir(cv_reader.api)}")
+    if not os.path.exists(video_path):
+        print(f"FAIL: Can't find video at {video_path}")
         exit(1)
 
-    # 2. Extract and Print (If we got here, we have a 'cap' or 'reader')
-    # If we used the VideoCapture class:
-    if 'cap' in locals():
-        valid, frame, mv, res = cap.read()
-
-    if valid:
-        print("\n" + "💎" * 15)
-        print("  THE DATA IS REAL!")
-        print("💎" * 15)
-        print(f"🖼️  Frame:     {frame.shape}")
-        print(f"🏎️  Vectors:   {mv.shape if mv is not None else 'N/A'}")
-        print(f"🧹 Residuals: {res.shape if res is not None else 'N/A'}")
-        print("💎" * 15)
+    # 1. Access the 'read_video' function we confirmed exists
+    if hasattr(cv_reader, 'read_video'):
+        print("Success: Found 'read_video' function.")
+        
+        # This returns a LIST of frames
+        all_frames = cv_reader.read_video(video_path)
+        
+        if isinstance(all_frames, list) and len(all_frames) > 0:
+            print(f"Successfully decoded {len(all_frames)} frames!")
+            
+            # 2. Extract data from the first frame
+            # The researcher's tuple is usually (frame, motion_vectors, residuals)
+            first_frame_data = all_frames[0]
+            
+            # Handle different possible tuple lengths (3 or 4 items)
+            if len(first_frame_data) == 3:
+                frame, mv, res = first_frame_data
+            else:
+                _, frame, mv, res = first_frame_data # Skip the 'valid' bit if it's there
+                
+            print("\n" + "💎" * 15)
+            print("  THE DATA IS REAL!")
+            print("💎" * 15)
+            print(f"🖼️  Frame Shape:     {frame.shape}")
+            print(f"🏎️  Motion Vectors:  {mv.shape if mv is not None else 'N/A'}")
+            print(f"🧹 Residuals:       {res.shape if res is not None else 'N/A'}")
+            print("💎" * 15)
+        else:
+            print("FAIL: read_video returned an empty list or invalid data.")
     else:
-        print("FAIL: The reader found the file but couldn't decode the frame.")
+        print(f"FAIL: Could not find read_video. Attributes: {dir(cv_reader)}")
 
 except Exception as e:
     print(f"CRITICAL ERROR: {e}")

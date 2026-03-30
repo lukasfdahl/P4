@@ -4,46 +4,48 @@ import os
 script_dir = os.path.dirname(os.path.abspath(__file__))
 video_path = os.path.join(script_dir, "test_video.mp4")
 
-print("--- THE VICTORY LAP ---")
+print("--- FRAME 6 RESIDUAL EXTRACTION ---")
 
 try:
+    # 1. Decode the video
     all_frames = cv_reader.read_video(video_path)
-    print(f"Decoded {len(all_frames)} frames.")
+    print(f"Total frames decoded: {len(all_frames)}")
 
-    # We look at Frame 1 (usually the first P-frame with data)
-    # If the video is long, we search for the first frame with motion vectors
-    target_frame = None
-    for f in all_frames:
-        if f.get('mv') is not None:
-            target_frame = f
-            break
-    
-    # Fallback to frame 0 if no MVs found
-    if target_frame is None:
-        target_frame = all_frames[0]
-
-    print("\n" + "⭐" * 20)
-    print("      FINAL DATA")
-    print("⭐" * 20)
-    
-    # Dimensions
-    print(f"📐 Size:      {target_frame.get('width')}x{target_frame.get('height')}")
-    
-    # Residuals (In this library, the 'bgr' key holds the residual data)
-    res_data = target_frame.get('bgr')
-    if res_data is not None:
-        print(f"🧹 Residuals: {res_data.shape} (Key: 'bgr')")
-    
-    # Motion Vectors
-    mv_data = target_frame.get('mv')
-    if mv_data is not None:
-        print(f"🏎️  Vectors:   {mv_data.shape} (Key: 'mv')")
-    else:
-        print("🏎️  Vectors:   None (This is an I-Frame)")
+    if len(all_frames) > 6:
+        # 2. Grab Frame 6 (The 7th frame)
+        f = all_frames[6]
         
-    print("⭐" * 20)
+        print("\n" + "🔍" * 15)
+        print("  FRAME 6 DATA FOUND")
+        print("🔍" * 15)
+        
+        # In this library, 'bgr' contains the Residual/Difference image
+        res_data = f.get('bgr')
+        # 'mv' contains the Motion Vectors
+        mv_data = f.get('mv')
+        
+        print(f"📄 Frame Type:    {f.get('type', 'P-Frame (assumed)')}")
+        
+        if res_data is not None:
+            print(f"🧹 Residual Shape: {res_data.shape}")
+            print(f"   (This is the pixel-level difference data)")
+        else:
+            print("🧹 Residuals:      NOT FOUND in 'bgr' key.")
+            
+        if mv_data is not None:
+            print(f"🏎️  Vector Shape:   {mv_data.shape}")
+            print(f"   (This is the macroblock movement data)")
+        else:
+            print("🏎️  Vectors:        NOT FOUND in 'mv' key.")
+            
+        print("🔍" * 15)
+        
+        # If keys are still weird, this will tell us why:
+        if res_data is None or mv_data is None:
+            print(f"\nAvailable keys in this frame: {list(f.keys())}")
+            
+    else:
+        print(f"FAIL: Video only has {len(all_frames)} frames. Need at least 7.")
 
 except Exception as e:
-    print(f"Error: {e}")
-    if all_frames:
-        print(f"Available keys in frame: {list(all_frames[0].keys())}")
+    print(f"CRITICAL ERROR: {e}")

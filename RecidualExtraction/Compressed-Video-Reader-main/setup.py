@@ -42,7 +42,7 @@ setup(
         ]
     },
     python_requires='>=3.7, <4',
-    install_requires=['pkgconfig>=1.5.1', 'numpy>=1.17.0', 'flow-vis>=0.1', 'opencv-python>=4.0'],
+    install_requires=['pkgconfig>=1.5.1', 'numpy<2.0.0', 'flow-vis>=0.1', 'opencv-python>=4.0'],
     url='https://github.com/AcherStyx/Compressed-Video-Reader',
     project_urls={
         'Source': 'https://github.com/AcherStyx/Compressed-Video-Reader',

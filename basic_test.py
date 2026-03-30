@@ -1,53 +1,49 @@
 import cv_reader
 import os
 
-# Path Setup
 script_dir = os.path.dirname(os.path.abspath(__file__))
 video_path = os.path.join(script_dir, "test_video.mp4")
 
-print("--- THE FINAL RESIDUAL HUNT ---")
+print("--- THE VICTORY LAP ---")
 
 try:
-    if not os.path.exists(video_path):
-        print(f"FAIL: Can't find video at {video_path}")
-        exit(1)
-
-    print("Decoding video...")
     all_frames = cv_reader.read_video(video_path)
+    print(f"Decoded {len(all_frames)} frames.")
+
+    # We look at Frame 1 (usually the first P-frame with data)
+    # If the video is long, we search for the first frame with motion vectors
+    target_frame = None
+    for f in all_frames:
+        if f.get('mv') is not None:
+            target_frame = f
+            break
     
-    if all_frames and len(all_frames) > 0:
-        print(f"Successfully decoded {len(all_frames)} frames!")
-        
-        # 1. Grab the first dictionary
-        f = all_frames[0]
-        
-        print("\n" + "💎" * 15)
-        print("  THE DATA IS REAL!")
-        print("💎" * 15)
-        
-        # 2. Pull data using the keys we found in the diagnostic
-        # We'll use .get() to be safe
-        print(f"📄 Frame Type:    {f.get('type', 'N/A')}")
-        print(f"📐 Dimensions:    {f.get('width')}x{f.get('height')}")
-        
-        # The actual image/residual data is usually under 'data' or 'residual'
-        data = f.get('data')
-        if data is not None:
-            print(f"🖼️  Data Shape:    {data.shape} (Residual/Frame)")
-        
-        # Motion vectors are usually 'mv'
-        mv = f.get('mv')
-        if mv is not None:
-            print(f"🏎️  Motion Vectors: {mv.shape}")
-        else:
-            print("🏎️  Motion Vectors: None")
-            
-        print("💎" * 15)
-        
+    # Fallback to frame 0 if no MVs found
+    if target_frame is None:
+        target_frame = all_frames[0]
+
+    print("\n" + "⭐" * 20)
+    print("      FINAL DATA")
+    print("⭐" * 20)
+    
+    # Dimensions
+    print(f"📐 Size:      {target_frame.get('width')}x{target_frame.get('height')}")
+    
+    # Residuals (In this library, the 'bgr' key holds the residual data)
+    res_data = target_frame.get('bgr')
+    if res_data is not None:
+        print(f"🧹 Residuals: {res_data.shape} (Key: 'bgr')")
+    
+    # Motion Vectors
+    mv_data = target_frame.get('mv')
+    if mv_data is not None:
+        print(f"🏎️  Vectors:   {mv_data.shape} (Key: 'mv')")
     else:
-        print("FAIL: read_video returned no data.")
+        print("🏎️  Vectors:   None (This is an I-Frame)")
+        
+    print("⭐" * 20)
 
 except Exception as e:
-    print(f"CRITICAL ERROR: {e}")
-    if 'all_frames' in locals() and len(all_frames) > 0:
-        print(f"Dictionary Keys available: {list(all_frames[0].keys())}")
+    print(f"Error: {e}")
+    if all_frames:
+        print(f"Available keys in frame: {list(all_frames[0].keys())}")

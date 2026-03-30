@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY Compressed-Video-Reader /app/Compressed-Video-Reader
+COPY Compressed-Video-Reader-main /app/Compressed-Video-Reader-main
 
 WORKDIR /app/Compressed-Video-Reader-main
 RUN bash install.sh

@@ -12,37 +12,40 @@ try:
         print(f"FAIL: Can't find video at {video_path}")
         exit(1)
 
-    # 1. Access the 'read_video' function we confirmed exists
-    if hasattr(cv_reader, 'read_video'):
-        print("Success: Found 'read_video' function.")
+    # 1. Use the read_video function
+    print("Decoding video...")
+    all_frames = cv_reader.read_video(video_path)
+    
+    if all_frames and len(all_frames) > 0:
+        print(f"Successfully decoded {len(all_frames)} frames!")
         
-        # This returns a LIST of frames
-        all_frames = cv_reader.read_video(video_path)
+        # 2. THE FLEXIBLE UNPACK
+        # This takes the first 3 items and puts everything else into 'extra'
+        # Researcher format is usually: (Type, Data, MotionVectors, ...rest)
+        first_frame = all_frames[0]
         
-        if isinstance(all_frames, list) and len(all_frames) > 0:
-            print(f"Successfully decoded {len(all_frames)} frames!")
-            
-            # 2. Extract data from the first frame
-            # The researcher's tuple is usually (frame, motion_vectors, residuals)
-            first_frame_data = all_frames[0]
-            
-            # Handle different possible tuple lengths (3 or 4 items)
-            if len(first_frame_data) == 3:
-                frame, mv, res = first_frame_data
-            else:
-                _, frame, mv, res = first_frame_data # Skip the 'valid' bit if it's there
-                
-            print("\n" + "💎" * 15)
-            print("  THE DATA IS REAL!")
-            print("💎" * 15)
-            print(f"🖼️  Frame Shape:     {frame.shape}")
-            print(f"🏎️  Motion Vectors:  {mv.shape if mv is not None else 'N/A'}")
-            print(f"🧹 Residuals:       {res.shape if res is not None else 'N/A'}")
-            print("💎" * 15)
+        # We grab the first 3 elements and ignore the rest
+        f_type, data, mv, *extra = first_frame
+        
+        print("\n" + "💎" * 15)
+        print("  THE DATA IS REAL!")
+        print("💎" * 15)
+        print(f"📄 Frame Type:    {f_type}")
+        print(f"🖼️  Data Shape:    {data.shape} (Residual/Frame)")
+        
+        if mv is not None:
+            print(f"🏎️  Motion Vectors: {mv.shape}")
         else:
-            print("FAIL: read_video returned an empty list or invalid data.")
+            print("🏎️  Motion Vectors: None (I-Frame)")
+            
+        print(f"🎁 Extra Info:    {len(extra)} other hidden fields found")
+        print("💎" * 15)
+        
     else:
-        print(f"FAIL: Could not find read_video. Attributes: {dir(cv_reader)}")
+        print("FAIL: read_video returned no data.")
 
 except Exception as e:
     print(f"CRITICAL ERROR: {e}")
+    # Final fallback: just tell us what the first frame actually IS
+    if 'all_frames' in locals() and len(all_frames) > 0:
+        print(f"Raw data structure of frame 0: {type(all_frames[0])} with length {len(all_frames[0])}")

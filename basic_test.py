@@ -1,46 +1,44 @@
-import cv_reader.reader  # <-- We import the sub-module directly
+import cv_reader
+import cv_reader.api # Specifically load the C++ engine
 import os
-import sys
 
-# 1. Path Setup
+# Path Setup
 script_dir = os.path.dirname(os.path.abspath(__file__))
 video_path = os.path.join(script_dir, "test_video.mp4")
 
-print("--- FINAL DATA EXTRACTION ---")
+print("--- THE FINAL RESIDUAL HUNT ---")
 
 try:
-    # 2. Access the class through the sub-module
-    # Based on your log, 'reader' is the place where the logic lives.
-    print(f"Opening video: {video_path}")
-    
-    # We use cv_reader.reader.VideoCapture
-    cap = cv_reader.reader.VideoCapture(video_path)
-    
-    # 3. Read the first frame
-    valid, frame, mv, res = cap.read()
-    
-    if valid:
-        print("\n" + "⭐" * 30)
-        print("   EXTRACTION COMPLETE!")
-        print("⭐" * 30)
-        print(f"🖼️  Frame Size:     {frame.shape}")
-        
-        if mv is not None:
-            print(f"🏎️  Motion Vectors: {mv.shape}")
-        else:
-            print("🏎️  Motion Vectors: NOT FOUND (Check P-frames)")
-            
-        if res is not None:
-            print(f"🧹 Residuals:      {res.shape}")
-        else:
-            print("🧹 Residuals:      NOT FOUND")
-        print("⭐" * 30)
+    # 1. Try to find the class in the 'api' sub-module
+    # Your log showed 'api' is available. That is where the C++ VideoCapture lives.
+    if hasattr(cv_reader.api, 'VideoCapture'):
+        print("Success: Found 'VideoCapture' inside the api module.")
+        cap = cv_reader.api.VideoCapture(video_path)
+    elif hasattr(cv_reader, 'read_video'):
+        print("Success: Found 'read_video' function.")
+        # Some versions use a function that returns a generator
+        # We will try to get the first frame from it
+        reader = cv_reader.read_video(video_path)
+        valid, frame, mv, res = next(reader)
     else:
-        print("FAIL: The reader opened the file, but couldn't decode data.")
+        print(f"FAIL: Still can't find the entry point. Attributes: {dir(cv_reader.api)}")
+        exit(1)
+
+    # 2. Extract and Print (If we got here, we have a 'cap' or 'reader')
+    # If we used the VideoCapture class:
+    if 'cap' in locals():
+        valid, frame, mv, res = cap.read()
+
+    if valid:
+        print("\n" + "💎" * 15)
+        print("  THE DATA IS REAL!")
+        print("💎" * 15)
+        print(f"🖼️  Frame:     {frame.shape}")
+        print(f"🏎️  Vectors:   {mv.shape if mv is not None else 'N/A'}")
+        print(f"🧹 Residuals: {res.shape if res is not None else 'N/A'}")
+        print("💎" * 15)
+    else:
+        print("FAIL: The reader found the file but couldn't decode the frame.")
 
 except Exception as e:
     print(f"CRITICAL ERROR: {e}")
-    # If VideoCapture isn't in reader, let's see what IS in there
-    if 'cv_reader' in sys.modules:
-        import cv_reader.reader
-        print(f"Contents of cv_reader.reader: {dir(cv_reader.reader)}")

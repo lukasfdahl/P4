@@ -22,6 +22,7 @@ pipeline {
                 sh "docker build -f RecidualExtraction/Dockerfile -t video-extractor-container:${env.BUILD_ID} ."
             }
         }
+    }
 
     post {
         always {

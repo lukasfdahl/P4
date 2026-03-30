@@ -1,51 +1,32 @@
 import cv_reader
 import os
+import numpy as np
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 video_path = os.path.join(script_dir, "test_video.mp4")
 
-print("--- FRAME 6 RESIDUAL EXTRACTION ---")
+print("--- DICTIONARY DETECTIVE ---")
 
 try:
-    # 1. Decode the video
     all_frames = cv_reader.read_video(video_path)
-    print(f"Total frames decoded: {len(all_frames)}")
-
     if len(all_frames) > 6:
-        # 2. Grab Frame 6 (The 7th frame)
         f = all_frames[6]
+        print(f"Frame 6 detected. Keys in dictionary: {list(f.keys())}")
         
         print("\n" + "🔍" * 15)
-        print("  FRAME 6 DATA FOUND")
+        for key, value in f.items():
+            # If it's a numpy array, print its shape
+            if isinstance(value, np.ndarray):
+                print(f"✅ {key}: Array of shape {value.shape}")
+            # If it's a small value (like width/height), print it
+            elif isinstance(value, (int, str, float)):
+                print(f"ℹ️  {key}: {value}")
+            else:
+                print(f"❓ {key}: Type {type(value)}")
         print("🔍" * 15)
         
-        # In this library, 'bgr' contains the Residual/Difference image
-        res_data = f.get('bgr')
-        # 'mv' contains the Motion Vectors
-        mv_data = f.get('mv')
-        
-        print(f"📄 Frame Type:    {f.get('type', 'P-Frame (assumed)')}")
-        
-        if res_data is not None:
-            print(f"🧹 Residual Shape: {res_data.shape}")
-            print(f"   (This is the pixel-level difference data)")
-        else:
-            print("🧹 Residuals:      NOT FOUND in 'bgr' key.")
-            
-        if mv_data is not None:
-            print(f"🏎️  Vector Shape:   {mv_data.shape}")
-            print(f"   (This is the macroblock movement data)")
-        else:
-            print("🏎️  Vectors:        NOT FOUND in 'mv' key.")
-            
-        print("🔍" * 15)
-        
-        # If keys are still weird, this will tell us why:
-        if res_data is None or mv_data is None:
-            print(f"\nAvailable keys in this frame: {list(f.keys())}")
-            
     else:
-        print(f"FAIL: Video only has {len(all_frames)} frames. Need at least 7.")
+        print(f"Not enough frames. Found {len(all_frames)}")
 
 except Exception as e:
     print(f"CRITICAL ERROR: {e}")

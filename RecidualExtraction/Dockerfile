@@ -12,12 +12,12 @@ WORKDIR /app
 
 COPY . /app/
 
-WORKDIR /app/Compressed-Video-Reader
+WORKDIR /app/Compressed-Video-Reader-main
 RUN bash install.sh
 RUN pip install --no-cache-dir .
 
-ENV PKG_CONFIG_PATH="/app/Compressed-Video-Reader/ffmpeg/lib/pkgconfig"
-ENV LD_LIBRARY_PATH="/app/Compressed-Video-Reader/ffmpeg/lib:${LD_LIBRARY_PATH}"
+ENV PKG_CONFIG_PATH="/app/Compressed-Video-Reader-main/ffmpeg/lib/pkgconfig"
+ENV LD_LIBRARY_PATH="/app/Compressed-Video-Reader-main/ffmpeg/lib:${LD_LIBRARY_PATH}"
 
 WORKDIR /app
 

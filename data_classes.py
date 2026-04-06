@@ -21,3 +21,7 @@ class Frame:
     residuals         : ndarray      # H x W x 3  uint8
     true_bounding_boxes : list[float]  # [xmin, xmax]  normalised to [0, 1]
     true_class          : int          # single class label per frame
+
+@dataclass
+class Clip:
+    frames : list[Frame] # a list of all the frames in the clip in order.

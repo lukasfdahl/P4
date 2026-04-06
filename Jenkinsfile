@@ -25,7 +25,8 @@ pipeline {
         stage("Run Basic Test") {
             steps {
                 echo "Running basic test to see if library is working:"
-                sh "docker run --rm -v \'${WORKSPACE}\':/app/test video-extractor-container:${env.BUILD_ID} python3 /app/test/basic_test.py"
+                sh "docker run --rm -v \'${WORKSPACE}\':/app/test video-extractor-container:${env.BUILD_ID} python3 /app/test/extractor.py"
+                archiveArtifacts artifacts: 'output_data/*.*', allowEmptyArchive: false // To save the output files for download by us
             }
         }
     }

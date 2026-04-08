@@ -81,17 +81,12 @@ class VideoFrameDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         frame: Frame = self.frames[self.indices[idx]]
 
-        #Motion vectors → (MV_PER_FRAME, 10) float tensor
-        mv_fields = [
-            "source", "width", "height",
-            "source_x", "source_y",
-            "destination_x", "destination_y",
-            "motion_x", "motion_y", "motion_scale",
-        ]
-        mv_array = np.array(
-            [[getattr(mv, f) for f in mv_fields] for mv in frame.motion_vectors],
-            dtype=np.float32,
-        )
+        mv_array = np.column_stack([
+            frame.motion_vectors['source'],
+            frame.motion_vectors['motion_x'],
+            frame.motion_vectors['motion_y'],
+            frame.motion_vectors['motion_scale']
+        ]).astype(np.float32)
         motion_vectors = torch.from_numpy(mv_array)
 
         #Frame type → int

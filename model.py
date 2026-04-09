@@ -3,6 +3,7 @@ import torch.nn as nn
 from data_classes import Frame
 
 
+# prepare and tokenize the data for the transformer model
 class VideoBackbone(nn.Module):
     def __init__(self):
         super().__init__()
@@ -10,7 +11,7 @@ class VideoBackbone(nn.Module):
     def forward(self, video_frames):
         pass
 
-
+# the actual core of the transformer model
 class TransformerCore(nn.Module):
     def __init__(self):
         super().__init__()
@@ -18,7 +19,7 @@ class TransformerCore(nn.Module):
     def forward(self, features):
         pass
 
-
+# the predection heads that take the transformers outputs and uses them to predict a bounding box and a class
 class PredictionHeads(nn.Module):
     def __init__(self, hidden_dim, num_classes):
         super().__init__()
@@ -32,7 +33,7 @@ class PredictionHeads(nn.Module):
         return boxes, classes
     
 
-
+# the full trasformer model with the backbone core and head all combined.
 class ObjectDetector(nn.Module):
     def __init__(self, num_classes):
         super().__init__()

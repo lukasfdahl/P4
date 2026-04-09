@@ -5,9 +5,9 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Variables
-Dataset_file = "yt_bb_detection_train.csv"
+Dataset_file = "/app/test/yt_bb_detection_train.csv"
 Samples_size = 1000
-Output_dir = "downloaded_videos"
+Output_dir = "/app/test/input_videos"
 Threads = 8
 
 # For reproducibility

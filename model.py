@@ -287,7 +287,7 @@ def _generate_dummy_data(batch_size, clip_length=5, h_tokens=4, w_tokens=4, bloc
 
 
 if __name__ == "__main__":
-    CLIP_LENGTH    = 5
+    CLIP_LENGTH    = 30
     H_TOKENS       = 4
     W_TOKENS       = 4
     BLOCK_SIZE     = 16

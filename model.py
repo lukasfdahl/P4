@@ -306,6 +306,9 @@ if __name__ == "__main__":
 
     wrapped_model = WrappedModel(model, frame_types)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    wrapped_model.to(device)
+    
     summary(
         wrapped_model,
         input_data=(motion_vectors, residuals),

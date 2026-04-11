@@ -25,3 +25,19 @@ def import_clip(clip_path : str) -> Clip:
     return Clip(frames)
 
 
+if __name__ == "__main__":
+    test_clip = import_clip("test video.npz")
+    print(len(test_clip.frames))
+    print("frame 0:")
+    print(test_clip.frames[0].frame_type)
+    print(test_clip.frames[0].motion_vectors.shape)
+    print(test_clip.frames[0].residuals.shape)
+    print(np.all(test_clip.frames[0].motion_vectors['motion_x'] == 0)) #was all the motion vectors still (which is expected since it is an i frame)
+    
+    print("frame 1:")
+    print(test_clip.frames[1].frame_type)
+    print(test_clip.frames[1].motion_vectors.shape)
+    print(test_clip.frames[1].residuals.shape)
+    print(np.all(test_clip.frames[1].motion_vectors['motion_x'] == 0))#was all the motion vectors still (which is not expected since it is an p frame)
+    
+    

@@ -58,7 +58,7 @@ def download_video(video_id):
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl: # type: ignore (makes the type checker ignore this line (it does not like it))
             ydl.download([url])
         return (video_id, "success")
 

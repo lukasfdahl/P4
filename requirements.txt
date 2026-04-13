@@ -4,3 +4,4 @@ torch
 yt_dlp
 pandas
 torchinfo
+torchview

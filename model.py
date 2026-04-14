@@ -12,7 +12,7 @@ class MultiScaleH264Tokenizer(nn.Module):
     Tokenizes each frame at multiple block sizes simultaneously, then fuses
     them with a small learned gate.
  
-    Scales and their token grids for a 64×64 frame:
+    Scales and their token grids for a frame:
         scale  8  →  8×8  = 64 tokens  (finest, most spatial detail)
         scale 16  →  4×4  = 16 tokens  (native H.264 MV resolution)
         scale 32  →  2×2  =  4 tokens  (coarsest, global motion cues)

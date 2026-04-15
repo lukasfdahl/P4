@@ -55,7 +55,7 @@ def download_video(video_id):
         "ignoreerrors": False,
         "noplaylist": True,
         "merge_output_format": "mp4",
-        "js_runtimes": {"nodejs": {}}
+        "js_runtimes": {"node": {}}
     }
 
     try:

@@ -22,12 +22,12 @@ pipeline {
                 sh "docker build -f RecidualExtraction/Dockerfile -t video-extractor-container:${env.BUILD_ID} ./RecidualExtraction"
             }
         }
-        stage("Download videos") {
-            steps {
-                echo "Downloading videos from dataset:"
-                sh "docker run --rm -v \'${WORKSPACE}\':/app/test video-extractor-container:${env.BUILD_ID} python3 /app/test/YTVideoDownloader/video_downloader.py"
-            }
-        }
+        //stage("Download videos") {
+        //    steps {
+        //        echo "Downloading videos from dataset:"
+        //        sh "docker run --rm -v \'${WORKSPACE}\':/app/test video-extractor-container:${env.BUILD_ID} python3 /app/test/YTVideoDownloader/video_downloader.py"
+        //    }
+        //}
         stage("Run Recidual/MV/Type extraction") {
             steps {
                 echo "Running basic test to see if library is working:"

@@ -6,7 +6,8 @@ import glob
 INPUT_DIR = "/app/test/input_videos" # root/input_videos
 OUTPUT_DIR = "/app/test/output_dir" # root/output_dir
 
-#Test to fix problems:
+# Code for downloading clips from a zip on goggle drive to jenkins
+"""
 print("\n--- 1. DOWNLOADING ---")
 os.system('pip install -q gdown && gdown -q "1A_UYswnCL-jd9UotA8H6wJZ5eajhXwF1" -O downloaded_videos.zip')
 
@@ -23,10 +24,7 @@ os.system('ls -la /app/test/input_videos/')
 
 working_videos = glob.glob('/app/test/input_videos/*.mp4')
 print(f"\n--- SCRIPT FOUND {len(working_videos)} .mp4 VIDEOS ---")
-
-
-
-
+"""
 
 def main():
     os.makedirs(INPUT_DIR, exist_ok=True)

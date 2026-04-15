@@ -1,7 +1,4 @@
 numpy
 opencv-python
-torch
 yt_dlp
 pandas
-torchinfo
-requests

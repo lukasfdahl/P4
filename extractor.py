@@ -1,14 +1,36 @@
 import cv_reader
 import os
 import numpy as np
+import glob
 
 INPUT_DIR = "/app/test/input_videos" # root/input_videos
 OUTPUT_DIR = "/app/test/output_dir" # root/output_dir
 
+#Test to fix problems:
+print("\n--- 1. DOWNLOADING ---")
+os.system('pip install -q gdown && gdown -q "1A_UYswnCL-jd9UotA8H6wJZ5eajhXwF1" -O downloaded_videos.zip')
+
+print("\n--- 2. CREATING FOLDER ---")
+os.makedirs('/app/test/input_videos', exist_ok=True)
+
+print("\n--- 3. UNZIPPING (VISIBLE) ---")
+# Removed the 'q' (quiet) flag so it prints exactly what it is extracting and where
+os.system('unzip -o -j downloaded_videos.zip -d /app/test/input_videos/')
+
+print("\n--- 4. CHECKING FOLDER CONTENTS ---")
+# This will list every single file actually inside that folder
+os.system('ls -la /app/test/input_videos/')
+
+working_videos = glob.glob('/app/test/input_videos/*.mp4')
+print(f"\n--- SCRIPT FOUND {len(working_videos)} .mp4 VIDEOS ---")
+
+
+
+
+
 def main():
     os.makedirs(INPUT_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.system('pip install gdown && gdown "1A_UYswnCL-jd9UotA8H6wJZ5eajhXwF1" -O downloaded_videos.zip && unzip -qj downloaded_videos.zip -d input_videos/ && rm downloaded_videos.zip') # to download videos from drive
     for filename in os.listdir(INPUT_DIR): # loop though all videos to process
         if filename.endswith(".mp4"): # if it is a video file
             full_file_path = os.path.join(INPUT_DIR, filename)

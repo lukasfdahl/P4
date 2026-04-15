@@ -8,7 +8,7 @@ OUTPUT_DIR = "/app/test/output_dir" # root/output_dir
 def main():
     os.makedirs(INPUT_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.system('pip install -q gdown && gdown -q "1A_UYswnCL-jd9UotA8H6wJZ5eajhXwF1" -O downloaded_videos.zip && unzip -qj downloaded_videos.zip -d input_videos/ && rm downloaded_videos.zip') # to download videos from drive
+    os.system('pip install gdown && gdown "1A_UYswnCL-jd9UotA8H6wJZ5eajhXwF1" -O downloaded_videos.zip && unzip -qj downloaded_videos.zip -d input_videos/ && rm downloaded_videos.zip') # to download videos from drive
     for filename in os.listdir(INPUT_DIR): # loop though all videos to process
         if filename.endswith(".mp4"): # if it is a video file
             full_file_path = os.path.join(INPUT_DIR, filename)

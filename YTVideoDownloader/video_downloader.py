@@ -6,9 +6,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Variables
 Dataset_file = "/app/test/yt_bb_detection_train.csv"
-Samples_size = 1000
+Samples_size = 1
 Output_dir = "/app/test/input_videos"
-Threads = 8
+Threads = 1
 
 # For reproducibility
 np.random.seed(42)

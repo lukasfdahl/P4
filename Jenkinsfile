@@ -22,6 +22,12 @@ pipeline {
                 sh "docker build -f RecidualExtraction/Dockerfile -t video-extractor-container:${env.BUILD_ID} ./RecidualExtraction"
             }
         }
+        stage("Download videos") {
+            steps {
+                echo "Downloading videos from dataset:"
+                sh "docker run --rm -v \'${WORKSPACE}\':/app/test video-extractor-container:${env.BUILD_ID} python3 /app/test/YTVideoDownloader/video_downloader.py"
+            }
+        }
         stage("Run Recidual/MV/Type extraction") {
             steps {
                 echo "Running basic test to see if library is working:"
@@ -35,6 +41,8 @@ pipeline {
         always {
             echo "Cleaning up old Docker images:"
             sh "docker rmi video-extractor-container:${env.BUILD_ID} || true"
+            echo "Deleting downloaded video files to clear up space:"
+            find input_videos -name "*.mp4" -type f -delete //find and delete all .mp4 files in input videos folder
         }
         success {
             echo "Pipeline passed"

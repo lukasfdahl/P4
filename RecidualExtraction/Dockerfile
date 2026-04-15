@@ -27,8 +27,8 @@ ENV LD_LIBRARY_PATH="/app/Compressed-Video-Reader-main/ffmpeg/lib"
 
 WORKDIR /app
 
-COPY requirements.txt /app/
-RUN pip install -r requirements.txt
+COPY docker_requirements.txt /app/
+RUN pip install -r docker_requirements.txt
 
 # 7. Test to make sure it works during the build
 RUN python3 -c "import cv_reader; print('SUCCESS: cv_reader is linked and working.')"

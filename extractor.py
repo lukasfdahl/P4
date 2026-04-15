@@ -8,7 +8,7 @@ OUTPUT_DIR = "/app/test/output_dir" # root/output_dir
 def main():
     os.makedirs(INPUT_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.system('wget -qO vids.zip "https://drive.usercontent.google.com/download?id=1A_UYswnCL-jd9UotA8H6wJZ5eajhXwF1&export=download" && unzip -qj vids.zip -d input_videos/ && rm vids.zip') # to download videos from drive
+    os.system('wget -qO downloaded_videos.zip "https://drive.usercontent.google.com/download?id=1A_UYswnCL-jd9UotA8H6wJZ5eajhXwF1&export=download" && unzip -qj downloaded_videos.zip -d input_videos/ && rm downloaded_videos.zip') # to download videos from drive
     for filename in os.listdir(INPUT_DIR): # loop though all videos to process
         if filename.endswith(".mp4"): # if it is a video file
             full_file_path = os.path.join(INPUT_DIR, filename)

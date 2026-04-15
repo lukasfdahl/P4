@@ -94,6 +94,7 @@ while len(working) < Samples_size and len(remaining_pool) > 0:
                 working.append(vid)
             else:
                 missing.append(vid)
+                print(f"Failed to download {vid}. Reason: {status}")
 
     print(f"Progress: {len(working)}/{Samples_size} downloaded")
 

@@ -30,5 +30,10 @@ WORKDIR /app
 COPY docker_requirements.txt /app/
 RUN pip install -r docker_requirements.txt
 
+# here to download dataset file for the video downloader.
+RUN apt-get update && apt-get install -y wget gzip
+RUN wget https://research.google.com/youtube-bb/yt_bb_detection_train.csv.gz -O /app/yt_bb_detection_train.csv.gz
+RUN gzip -d /app/yt_bb_detection_train.csv.gz
+
 # 7. Test to make sure it works during the build
 RUN python3 -c "import cv_reader; print('SUCCESS: cv_reader is linked and working.')"

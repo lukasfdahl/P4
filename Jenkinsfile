@@ -41,8 +41,8 @@ pipeline {
         always {
             echo "Cleaning up old Docker images:"
             sh "docker rmi video-extractor-container:${env.BUILD_ID} || true"
-            echo "Deleting downloaded video files to clear up space:"
-            sh "find input_videos -name '*.mp4' -type f -delete" //find and delete all .mp4 files in input videos folder
+            //echo "Deleting downloaded video files to clear up space:"
+            //sh "find input_videos -name '*.mp4' -type f -delete" //find and delete all .mp4 files in input videos folder
         }
         success {
             echo "Pipeline passed"

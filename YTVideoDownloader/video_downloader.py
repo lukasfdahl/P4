@@ -70,7 +70,7 @@ def download_video(video_id):
 
 results = []
 
-print("\nCollecting 1000 downloadable videos...\n")
+print(f"\nCollecting {Samples_size} downloadable videos...\n")
 
 while len(working) < Samples_size and len(remaining_pool) > 0:
 

@@ -6,12 +6,6 @@ pipeline {
     }
 
     stages {
-        stage('Clean Permissions') {
-            steps {
-                // This uses Docker to delete the folder that Docker created
-                sh 'docker run --rm -v ${WORKSPACE}:/workspace alpine sh -c "rm -rf /workspace/input_videos"'
-            }
-        }
         stage("Checkout") {
             steps {
                 // Jenkins automatically clones the GitHub repo here

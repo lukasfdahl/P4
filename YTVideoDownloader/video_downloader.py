@@ -52,7 +52,7 @@ def download_video(video_id):
         "outtmpl": os.path.join(Output_dir, "%(id)s.%(ext)s"),
         "format": "mp4[height<=720]/best",
         "quiet": True,
-        "ignoreerrors": True,
+        "ignoreerrors": False,
         "noplaylist": True,
         "merge_output_format": "mp4"
     }

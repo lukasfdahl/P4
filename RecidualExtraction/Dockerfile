@@ -31,7 +31,7 @@ COPY docker_requirements.txt /app/
 RUN pip install -r docker_requirements.txt
 
 # here to download dataset file for the video downloader.
-RUN apt-get update && apt-get install -y wget gzip
+RUN apt-get update && apt-get install -y python3 python3-pip nodejs wget gzip
 RUN wget https://research.google.com/youtube-bb/yt_bb_detection_train.csv.gz -O /app/yt_bb_detection_train.csv.gz
 RUN gzip -d /app/yt_bb_detection_train.csv.gz
 

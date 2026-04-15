@@ -12,15 +12,16 @@ def main():
     for filename in os.listdir(INPUT_DIR): # loop though all videos to process
         if filename.endswith(".mp4"): # if it is a video file
             full_file_path = os.path.join(INPUT_DIR, filename)
-            type_array, motion_vector_array, residual_array = extract_clip(full_file_path)
             video_output_name = filename.removesuffix(".mp4") + ".npz"
-            np.savez_compressed(
-                os.path.join(OUTPUT_DIR, video_output_name),
-                frame_types = type_array,
-                motion_vectors = motion_vector_array,
-                residuals = residual_array
-            )
-            print(f"successfully extracted data from video: {filename} and saved it to {os.path.join(OUTPUT_DIR, video_output_name)}")
+            if not os.path.exists(os.path.join(OUTPUT_DIR, video_output_name)): # Only extract data if the file is not already extracted from ealrier run
+                type_array, motion_vector_array, residual_array = extract_clip(full_file_path)
+                np.savez_compressed(
+                    os.path.join(OUTPUT_DIR, video_output_name),
+                    frame_types = type_array,
+                    motion_vectors = motion_vector_array,
+                    residuals = residual_array
+                )
+                print(f"successfully extracted data from video: {filename} and saved it to {os.path.join(OUTPUT_DIR, video_output_name)}")
 
 
 # extracts the frame types, motion vectors and reciduals from a given clip, and saves them as 3 seperate numpy arrays, one for each type.

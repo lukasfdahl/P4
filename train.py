@@ -7,6 +7,7 @@ import time
 import copy
 import os
 import numpy as np
+import yaml
 
 # Import from your repository files
 from eval_framework import BoundingBox, Prediction, ModelMetric, evaluate
@@ -103,6 +104,49 @@ def plot_metrics(train_losses, val_losses, val_maps, output_dir="charts"):
     plt.grid(True)
     plt.savefig(os.path.join(output_dir, 'map_plot.png'))
     plt.close()
+
+def generate_model_card(experiment_config, final_metrics, model, output_dir, file_name="model_card.yaml"):
+    """
+    Generates a YAML model card documenting the experiment configuration,
+    model size, and final evaluation metrics.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Calculate model size and parameters (Addresses NFR1)
+    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_size_mb = param_count * 4 / (1024 ** 2) # Assuming 32-bit floats
+    
+    # Structure the Model Card Dictionary
+    model_card = {
+        "model_details": {
+            "model_name": "Compressed-Domain-Object-Detector",
+            "architecture": "ConvLSTM + YOLO Head",
+            "developers": "AAU 4th Semester AI Engineering",
+        },
+        "experiment_configuration": experiment_config, # Passed in from your run
+        "training_parameters": {
+            "dataset": "YouTube-Bounding Boxes",
+            "classes": 23,
+        },
+        "evaluation_metrics": {
+            "mAP_50": round(final_metrics.mAP_50, 4),
+            "mAP_95": round(final_metrics.mAP_95, 4),
+            "accuracy": round(final_metrics.accuracy, 4),
+            "weighted_precision": round(final_metrics.weighted_precision, 4),
+            "mean_iou": round(final_metrics.iou, 4),
+        },
+        "efficiency_benchmarks": {
+            "latency_per_frame_seconds": round(final_metrics.latency, 5),
+            "parameters_count": param_count,
+            "model_size_mb": round(model_size_mb, 2),
+        }
+    }
+
+    file_path = os.path.join(output_dir, file_name)
+    with open(file_path, 'w') as yaml_file:
+        yaml.dump(model_card, yaml_file, default_flow_style=False, sort_keys=False)
+        
+    print(f"--> Model card saved to {file_path}")
 
 def tensors_to_eval_format(pred_tensors, target_boxes, target_classes):
     """
@@ -208,4 +252,21 @@ def train_model(model, train_loader, val_loader, num_epochs=50, patience=10, lea
     plot_metrics(train_losses, val_losses, val_maps)
     
     model.load_state_dict(best_model_wts)
+
+    current_experiment = {
+        "run_id": "exp_01",
+        "temporal_context": "multi_frame",
+        "sequence_length": 3,
+        "features_used": "combined",
+        "spatial_processing": "patches",
+        "data_scope": "timestamped_sections"
+    }
+
+    generate_model_card(
+        experiment_config=current_experiment,
+        final_metrics=metrics,
+        model=model,
+        output_dir="runs/exp_01"
+    )
+
     return model

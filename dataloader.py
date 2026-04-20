@@ -5,15 +5,15 @@ dataloader.py  –  clip-based data pipeline for ObjectDetector (see model.py)
  
 Each dataset sample is one Clip of CLIP_LENGTH frames.
 __getitem__ returns:
-    motion_vectors : [T, 4, H_tokens, W_tokens]   (float32)
-    residuals      : [T, 3, H, W]                  (float32, normalised to [0,1])
+    motion_vectors : [T, 4, H_tokens, W_tokens]   (float32)   – if USE_MOTIONVECTORS
+    residuals      : [T, 3, H, W]                  (float32, normalised to [0,1])  – if USE_RESIDUALS
     frame_types    : list[str]  length T
     boxes          : [T, 2]    float32  [xmin, xmax] per frame
     true_class     : [T]       int64    class label per frame
  
 collate_fn batches those into:
-    motion_vectors : [B, T, 4, H_tokens, W_tokens]
-    residuals      : [B, T, 3, H, W]
+    motion_vectors : [B, T, 4, H_tokens, W_tokens]  – if USE_MOTIONVECTORS
+    residuals      : [B, T, 3, H, W]                – if USE_RESIDUALS
     frame_types    : list[list[str]]  shape [B][T]   (can't stack strings)
     boxes          : [B, T, 2]
     true_class     : [B, T]
@@ -31,6 +31,13 @@ from dataclasses import asdict
 
 from data_classes import Frame, Clip, MV_STRUCT
 from import_data import import_clip
+
+# config for experiments, to toggle input features
+USE_MOTIONVECTORS = True   # include motion-vector stream
+USE_RESIDUALS     = True   # include residual (RGB) stream
+
+if not USE_MOTIONVECTORS and not USE_RESIDUALS:
+    raise ValueError("At least one of USE_MOTIONVECTORS or USE_RESIDUALS must be True.")
 
 # Config
 BATCH_SIZE  = 4   # only for dummy
@@ -109,6 +116,9 @@ class ClipDataset(Dataset):
  
     The H_tokens / W_tokens here correspond to BASE_MV_SCALE (16).
     The multi-scale tokenizer in model.py resamples internally to finer/coarser grids.
+
+    Which streams are active is controlled by the module-level flags
+    USE_MOTIONVECTORS and USE_RESIDUALS.
     """
  
     def __init__(
@@ -136,50 +146,59 @@ class ClipDataset(Dataset):
 
         # Iterate over frames in the clip
         for frame in clip.frames:
-            # motion vectors
-            # MV_STRUCT flat array [H_tokens * W_tokens] → [4, H_tokens, W_tokens]
-            n_mv   = len(frame.motion_vectors)
-            h_mv   = int(round(n_mv ** 0.5))   # assumes square token grid
-            w_mv   = n_mv // h_mv
-            mv_grid = np.stack([
-                frame.motion_vectors['source'].astype(np.float32),
-                frame.motion_vectors['motion_x'].astype(np.float32),
-                frame.motion_vectors['motion_y'].astype(np.float32),
-                frame.motion_vectors['motion_scale'].astype(np.float32),
-            ], axis=0).reshape(4, h_mv, w_mv)
-            mv_list.append(torch.from_numpy(mv_grid))
 
-            # residuals
-            # [H, W, 3] uint8 → [3, H, W] float32 in [0, 1]
-            res = torch.from_numpy(
-                frame.residuals.astype(np.float32) / 255.0
-            ).permute(2, 0, 1)
-            res_list.append(res)
+            if USE_MOTIONVECTORS:
+                # MV_STRUCT flat array [H_tokens * W_tokens] → [4, H_tokens, W_tokens]
+                n_mv   = len(frame.motion_vectors)
+                h_mv   = int(round(n_mv ** 0.5))   # assumes square token grid
+                w_mv   = n_mv // h_mv
+                mv_grid = np.stack([
+                    frame.motion_vectors['source'].astype(np.float32),
+                    frame.motion_vectors['motion_x'].astype(np.float32),
+                    frame.motion_vectors['motion_y'].astype(np.float32),
+                    frame.motion_vectors['motion_scale'].astype(np.float32),
+                ], axis=0).reshape(4, h_mv, w_mv)
+                mv_list.append(torch.from_numpy(mv_grid))
 
-            # annotations
+            if USE_RESIDUALS:
+                # [H, W, 3] uint8 → [3, H, W] float32 in [0, 1]
+                res = torch.from_numpy(
+                    frame.residuals.astype(np.float32) / 255.0
+                ).permute(2, 0, 1)
+                res_list.append(res)
+
+            # annotations (always included)
             frame_types.append(frame.frame_type)
             boxes_list.append(torch.tensor(frame.true_bounding_boxes, dtype=torch.float32))
             cls_list.append(torch.tensor(frame.true_class, dtype=torch.long))
- 
-        return {
-            "motion_vectors": torch.stack(mv_list),     # [T, 4, H_tokens, W_tokens]
-            "residuals":      torch.stack(res_list),     # [T, 3, H, W]
-            "frame_types":    frame_types,               # list[str], length T
-            "boxes":          torch.stack(boxes_list),   # [T, 2]
-            "true_class":     torch.stack(cls_list),     # [T]
+
+        sample = {
+            "frame_types": frame_types,                      # list[str], length T
+            "boxes":       torch.stack(boxes_list),          # [T, 2]
+            "true_class":  torch.stack(cls_list),            # [T]
         }
+        if USE_MOTIONVECTORS:
+            sample["motion_vectors"] = torch.stack(mv_list)  # [T, 4, H_tokens, W_tokens]
+        if USE_RESIDUALS:
+            sample["residuals"]      = torch.stack(res_list) # [T, 3, H, W]
+
+        return sample
  
 # arrrange items in order
 def collate_fn(batch: list[dict]) -> dict:
     #Stacks fixed-size tensors normally; boxes are now fixed (2,) so no padding needed.
 
-    return {
-        "motion_vectors": torch.stack([s["motion_vectors"] for s in batch]),
-        "frame_types":    [s["frame_types"]     for s in batch],
-        "residuals":      torch.stack([s["residuals"]      for s in batch]),
-        "boxes":          torch.stack([s["boxes"]          for s in batch]),  # (B, 2)
-        "true_class":     torch.stack([s["true_class"]     for s in batch]),  # (B,)
+    collated = {
+        "frame_types": [s["frame_types"] for s in batch],
+        "boxes":       torch.stack([s["boxes"]      for s in batch]),  # (B, T, 2)
+        "true_class":  torch.stack([s["true_class"] for s in batch]),  # (B, T)
     }
+    if USE_MOTIONVECTORS:
+        collated["motion_vectors"] = torch.stack([s["motion_vectors"] for s in batch])
+    if USE_RESIDUALS:
+        collated["residuals"]      = torch.stack([s["residuals"]      for s in batch])
+
+    return collated
 
 
 # helper to create dataset splits
@@ -254,6 +273,8 @@ def build_data_loaders(
     return train_loader, val_loader, test_loader
 
 if __name__ == "__main__":
+    print(f"[DataLoader] Streams active: motion_vectors={USE_MOTIONVECTORS}  residuals={USE_RESIDUALS}")
+
     train_loader, val_loader, test_loader = build_data_loaders()
 
     print(f"  Split sizes  |  train={len(train_loader.dataset)}"

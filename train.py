@@ -430,10 +430,13 @@ def main(config_path: str, resume: str | None = None) -> None:
     print({k: v.shape if isinstance(v, torch.Tensor) else "list"
        for k, v in batch.items()})
     
-    print(
-        f"[train] Splits  train={len(train_loader.dataset)}"  
-        f"  val={len(val_loader.dataset)}"           
-    )
+    # Safely get sizes even if val/test are empty lists
+    val_size = len(val_loader.dataset) if hasattr(val_loader, 'dataset') else 0
+    test_size = len(test_loader.dataset) if hasattr(test_loader, 'dataset') else 0
+
+    print(f"  Split sizes  |  train={len(train_loader.dataset)}"
+          f"  val={val_size}"
+          f"  test={test_size}")
 
     # configuration
     optimizer = AdamW(

@@ -67,15 +67,23 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-# --- LAZY LOADING HELPER ---
-def lazy_build_window_index(npz_files: list[str], clip_length: int, stride: int, snap_to_iframe: bool = True) -> list[tuple[int, int]]:
-    """Builds sliding windows by only reading the lightweight metadata of the NPZ files to save RAM."""
+# loading helper, lazy because not all in ram haha
+def lazy_build_window_index(
+    npz_files: list[str],
+    clip_length: int,
+    stride: int,
+    snap_to_iframe: bool = True,
+    filter_empty: bool = False,       # ← add this
+) -> list[tuple[int, int]]:
     window_index = []
-    
+    filtered = 0   
+    """Builds sliding windows by only reading the lightweight metadata of the NPZ files to save RAM."""
+
     for file_idx, file_path in enumerate(npz_files):
         # FAST LOAD: Only load the frame_types string array, skip the heavy residuals
         data = np.load(file_path)
         frame_types = data["frame_types"]
+        
         n = len(frame_types)
 
         if n < clip_length:
@@ -100,8 +108,12 @@ def lazy_build_window_index(npz_files: list[str], clip_length: int, stride: int,
 
             if start not in seen:
                 seen.add(start)
+
                 window_index.append((file_idx, start))
-                
+    print(
+        f"[lazy] built {len(window_index)} windows "
+        f"(filtered={filtered} empty)"  
+    )
     return window_index
 
 # Dummy-data helpers for testing rn
@@ -371,13 +383,21 @@ def build_data_loaders(
             npz_files = npz_files[:1]
             
         source_data = npz_files
-        window_index = lazy_build_window_index(source_data, clip_length=clip_length, stride=stride, snap_to_iframe=snap_to_iframe)
+        window_index = lazy_build_window_index(
+            source_data, clip_length=clip_length,
+            stride=stride, snap_to_iframe=snap_to_iframe,
+            filter_empty=True,
+        )
 
 
     else:
         # Fallback dummy logic
         source_data = build_dummy_dataset()
-        window_index = build_window_index(source_data, clip_length=clip_length, stride=clip_length, snap_to_iframe=True)
+        window_index = build_window_index(
+            source_data, clip_length=clip_length,
+            stride=stride, snap_to_iframe=snap_to_iframe,
+            filter_empty=True, 
+        )
 
     n_videos = len(source_data)
 

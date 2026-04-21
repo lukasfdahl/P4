@@ -10,7 +10,7 @@ experiment_name: "test123"
 # All values here are forwarded directly to ObjectDetector.__init__()
 
 model:
-  num_classes:        10       # must match your dataset, i think we have 23?
+  num_classes:        23       # must match your dataset, i think we have 23?
   scales:             [8, 16, 32]
   base_mv_scale:      16       # native H.264 MV block size — don't change
   clip_length:        5        # frames per forward pass — must match data.clip_length

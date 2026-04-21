@@ -124,49 +124,43 @@ def compute_loss(
 
     valid_frames = 0
 
-    for t in range(T):
+    # Clean nested loop to avoid PyTorch advanced indexing dimension shifting
+    for b in range(B):
+        for t in range(T):
+            gt_cls = gt_classes[b, t]
 
+            # Skip frames with no object (class == -1 sentinel)
+            if gt_cls == -1:
+                continue
 
-        gt_cls_t = gt_classes[:, t]          # [B]
-        gt_box_t = gt_boxes[:, t]            # [B, 4]
+            gt_box = gt_boxes[b, t]
 
-        # Skip frames with no object (class == -1, bbox == -1 sentinel).
-        valid_mask = gt_cls_t != -1
-        if not valid_mask.any():
-            continue
+            # For each batch item, find the query with the highest confidence
+            # for this frame's GT class (among queries not yet assigned).
+            class_scores = probs[b, :, gt_cls].clone()  # Shape: [num_queries]
 
-        batch_idx = torch.arange(B, device=pred_boxes.device)[valid_mask]
-        gt_cls_valid = gt_cls_t[valid_mask]
-        gt_box_valid = gt_box_t[valid_mask]
+            # Mask out already-assigned queries (set their score to -1)
+            class_scores.masked_fill_(used_queries[b], -1.0)
 
-        # For each batch item, find the query with the highest confidence
-        # for this frame's GT class (among queries not yet assigned).
-        # Shape of class_scores: [B, num_queries]
-        class_scores = probs[batch_idx, :, gt_cls_valid]  # [B, Q]
+            best_q = class_scores.argmax(dim=0)  # Pick best query index
 
-        # Mask out already-assigned queries (set their score to -1)
-        class_scores = class_scores.masked_fill(used_queries[valid_mask], -1.0)
+            # Mark this query as used
+            used_queries[b, best_q] = True
 
-        best_q = class_scores.argmax(dim=1)  # [B]
+            # Gather predictions for the matched query
+            matched_box   = pred_boxes[b, best_q]      # [4]
+            matched_logit = pred_classes[b, best_q]    # [num_classes]
 
-        # Mark these queries as used
-        used_queries[batch_idx, best_q] = True
+            # Losses (unsqueeze adds a dummy batch dim of 1 to keep PyTorch safe)
+            total_l1   = total_l1   + F.l1_loss(matched_box, gt_box)
+            total_giou = total_giou + giou_loss(matched_box.unsqueeze(0), gt_box.unsqueeze(0)).squeeze()
+            total_cls  = total_cls  + F.cross_entropy(matched_logit.unsqueeze(0), gt_cls.unsqueeze(0)).squeeze()
 
-        # Gather predictions for the matched queries
-        # pred_boxes[b, best_q[b], :] for each b
-        matched_boxes   = pred_boxes[batch_idx, best_q]    # [B, 4]
-        matched_logits  = pred_classes[batch_idx, best_q]  # [B, num_classes]
+            valid_frames += 1
 
-        # Losses
-        total_l1   = total_l1   + F.l1_loss(matched_boxes, gt_box_valid) # bbox loss
-        total_giou = total_giou + giou_loss(matched_boxes, gt_box_valid).mean()     # bbox loss
-        total_cls  = total_cls  + F.cross_entropy(matched_logits, gt_cls_valid) # class loss
-
-        valid_frames += 1
-
+    # Safe return if the entire batch happens to be empty clips
     if valid_frames == 0:
-
-        zero = pred_boxes.new_tensor(0.0)
+        zero = (pred_boxes * 0).sum() + (pred_classes * 0).sum()
         return zero, {
             "loss_total": 0.0,
             "loss_cls": 0.0,
@@ -174,7 +168,7 @@ def compute_loss(
             "loss_giou": 0.0,
         }
 
-    # Average over frames
+    # Average over valid frames
     total_l1   = total_l1   / valid_frames
     total_giou = total_giou / valid_frames
     total_cls  = total_cls  / valid_frames
@@ -231,18 +225,21 @@ def train_one_epoch(
         # forward calculation
         optimizer.zero_grad()
 
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+        with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             pred_boxes, pred_classes = model(mv, res, ft_sequence)
             loss, parts = compute_loss(pred_boxes, pred_classes, gt_boxes, gt_classes, cfg_loss)
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        # Gradient clipping, needed for stable training of transformers.  Clip to 1.0 by default, but configurable via YAML. should be tested. could also be rm if not needed...
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg_train.get("grad_clip", 1.0))
+        if loss.requires_grad:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            # Gradient clipping, needed for stable training of transformers.  Clip to 1.0 by default, but configurable via YAML. should be tested. could also be rm if not needed...
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg_train.get("grad_clip", 1.0))
 
-        # optimizer step
-        scaler.step(optimizer)
-        scaler.update()
+            # optimizer step
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            scaler.update()  # No backward, but still update scaler to avoid stalling if it was in a bad state
 
 
         # Update totals
@@ -303,7 +300,7 @@ def validate(
         # forward + latency measurement
         t0 = time.perf_counter()
 
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+        with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             pred_boxes, pred_classes = model(mv, res, ft_sequence)
             loss, parts = compute_loss(pred_boxes, pred_classes, gt_boxes, gt_classes, cfg_loss)
 
@@ -386,7 +383,7 @@ def main(config_path: str, resume: str | None = None) -> None:
 
         # mixed prec:
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
 
     #  Build model 

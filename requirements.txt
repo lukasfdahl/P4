@@ -5,3 +5,4 @@ yt_dlp
 pandas
 torchinfo
 torchview
+requests

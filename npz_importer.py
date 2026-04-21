@@ -95,7 +95,7 @@ labels = import_dataset()
 
 # some test code i made
 if __name__ == "__main__":
-    test_clip = import_clip("downloaded_videos/ASBfcxcC1hc.npz")
+    test_clip = import_clip("downloaded_videos/test video.npz")
     print(len(test_clip.frames))
     print("frame 0:")
     print(test_clip.frames[0].frame_type)

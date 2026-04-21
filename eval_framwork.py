@@ -1,33 +1,9 @@
-"""
-eval_framework.py  –  evaluation framework for ObjectDetector.
-
-Bounding-box format used throughout this file
-----------------------------------------------
-ALL boxes use the same format as data_classes.py and the dataloader:
-
-    [xmin, xmax, ymin, ymax]  –  all values normalised to [0, 1]
-
-This matches Frame.true_bounding_box and the model's sigmoid output.
-The old eval used [x, y, w, h]; that format has been removed to eliminate
-conversion bugs at the train/eval boundary.
-
-Public API
-----------
-BoundingBox   – ground-truth box dataclass  [xmin, xmax, ymin, ymax, class_id]
-Prediction    – prediction dataclass        [xmin, xmax, ymin, ymax, class_id, confidence]
-ModelMetric   – result container with .compare()
-evaluate(predictions, ground_truth, latency) -> ModelMetric
-"""
-
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 
-# ---------------------------------------------------------------------------
 # Data containers
-# ---------------------------------------------------------------------------
-
 @dataclass
 class BoundingBox:
     """
@@ -96,10 +72,7 @@ class ModelMetric:
         )
 
 
-# ---------------------------------------------------------------------------
-# IoU  (works on [xmin, xmax, ymin, ymax] normalised boxes)
-# ---------------------------------------------------------------------------
-
+# IoU
 def _compute_iou(box_a: BoundingBox, box_b: BoundingBox) -> float:
     """Intersection-over-Union for two [xmin, xmax, ymin, ymax] boxes."""
     ix1 = max(box_a.xmin, box_b.xmin)
@@ -116,9 +89,7 @@ def _compute_iou(box_a: BoundingBox, box_b: BoundingBox) -> float:
     return intersection / union if union > 0.0 else 0.0
 
 
-# ---------------------------------------------------------------------------
 # Matching
-# ---------------------------------------------------------------------------
 
 def _match_predictions(
     predictions:   List[Prediction],
@@ -152,9 +123,7 @@ def _match_predictions(
     return matched, unmatched_gt
 
 
-# ---------------------------------------------------------------------------
-# Average Precision (11-point interpolation, single class)
-# ---------------------------------------------------------------------------
+# Average Precision 
 
 def _compute_ap_for_class(
     predictions:   List[Prediction],
@@ -214,10 +183,7 @@ def _compute_ap_for_class(
     return ap / 11.0
 
 
-# ---------------------------------------------------------------------------
 # Main evaluator
-# ---------------------------------------------------------------------------
-
 def evaluate(
     predictions:  List[List[Prediction]],
     ground_truth: List[List[BoundingBox]],
@@ -248,8 +214,7 @@ def evaluate(
     all_preds = [p for frame in predictions for p in frame]
     all_gts   = [g for frame in ground_truth for g in frame]
 
-    # --- accuracy and mean IoU -----------------------------------------------
-    total_tp = 0
+    # accuracy and mean IoU 
     total_fn = 0
     tp_ious: List[float] = []
 
@@ -265,7 +230,7 @@ def evaluate(
     )
     mean_iou = sum(tp_ious) / len(tp_ious) if tp_ious else 0.0
 
-    # --- mAP_50 and mAP_95 ---------------------------------------------------
+    # mAP_50 and mAP_95
     class_ids = list({g.class_id for g in all_gts})
 
     ap50_per_class = [
@@ -280,7 +245,7 @@ def evaluate(
     mAP_50 = sum(ap50_per_class) / len(ap50_per_class) if ap50_per_class else 0.0
     mAP_95 = sum(ap95_per_class) / len(ap95_per_class) if ap95_per_class else 0.0
 
-    # --- weighted precision ---------------------------------------------------
+    # weighted precision
     gt_count_per_class: Dict[int, int] = defaultdict(int)
     for gt in all_gts:
         gt_count_per_class[gt.class_id] += 1
@@ -308,9 +273,7 @@ def evaluate(
     )
 
 
-# ---------------------------------------------------------------------------
 # Self-test  (python eval_framework.py)
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
 

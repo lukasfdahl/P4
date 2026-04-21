@@ -30,7 +30,7 @@ from torch.utils.data import Dataset, DataLoader
 from dataclasses import asdict
 
 from data_classes import Frame, Clip, MV_STRUCT
-from import_data import import_clip
+from npz_importer import import_clip
 
 # config for experiments, to toggle input features
 USE_MOTIONVECTORS = True   # include motion-vector stream
@@ -82,13 +82,16 @@ def _random_frame(frame_type: str | None = None) -> Frame:
     """Generates one synthetic Frame with random MV grid, residuals, and annotations to testt."""
     xmin = round(random.uniform(0.0, 0.8), 4)
     xmax = round(random.uniform(xmin, 1.0), 4)
+    ymin = round(random.uniform(0.0, 0.8), 4)
+    ymax = round(random.uniform(ymin, 1.0), 4)
     
     return Frame(
         motion_vectors      = _random_mv_grid(),
         frame_type          = frame_type or random.choice(["I", "P", "B"]),
         residuals           = np.random.randint(0, 256, (FRAME_H, FRAME_W, 3), dtype=np.uint8),
-        true_bounding_boxes = [xmin, xmax],
+        true_bounding_box   = (xmin, xmax, ymin, ymax),
         true_class          = random.randint(0, NUM_CLASSES - 1),
+        has_object          = True
     )
 
 
@@ -169,7 +172,7 @@ class ClipDataset(Dataset):
 
             # annotations (always included)
             frame_types.append(frame.frame_type)
-            boxes_list.append(torch.tensor(frame.true_bounding_boxes, dtype=torch.float32))
+            boxes_list.append(torch.tensor(frame.true_bounding_box, dtype=torch.float32))
             cls_list.append(torch.tensor(frame.true_class, dtype=torch.long))
 
         sample = {
@@ -266,9 +269,9 @@ def build_data_loaders(
         collate_fn         = collate_fn,
     )
  
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  **loader_kwargs)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs)
-    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  **loader_kwargs) # type: ignore
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs) # type: ignore
+    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs) # type: ignore
  
     return train_loader, val_loader, test_loader
 
@@ -277,9 +280,9 @@ if __name__ == "__main__":
 
     train_loader, val_loader, test_loader = build_data_loaders()
 
-    print(f"  Split sizes  |  train={len(train_loader.dataset)}"
-          f"  val={len(val_loader.dataset)}"
-          f"  test={len(test_loader.dataset)}")
+    print(f"  Split sizes  |  train={len(train_loader.dataset)}" # type: ignore
+          f"  val={len(val_loader.dataset)}" # type: ignore
+          f"  test={len(test_loader.dataset)}") # type: ignore
     print(f"  Batches/epoch (train): {len(train_loader)}")
 
     # Inspect first training batch
@@ -300,14 +303,14 @@ if __name__ == "__main__":
     print("Iterating through all train batches …", end=" ")
     for i, b in enumerate(train_loader):
         pass
-    print(f"done ({i+1} batches).\n")
+    print(f"done ({i+1} batches).\n") # type: ignore
 
     print("Iterating through all val batches …",   end=" ")
     for i, b in enumerate(val_loader):
         pass
-    print(f"done ({i+1} batches).\n")
+    print(f"done ({i+1} batches).\n") # type: ignore
 
     print("Iterating through all test batches …",  end=" ")
     for i, b in enumerate(test_loader):
         pass
-    print(f"done ({i+1} batches).\n")
+    print(f"done ({i+1} batches).\n") # type: ignore

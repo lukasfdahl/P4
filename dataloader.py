@@ -30,7 +30,7 @@ from torch.utils.data import Dataset, DataLoader
 from dataclasses import asdict
 
 from data_classes import Frame, Clip, MV_STRUCT
-from npz_importer import import_clip
+from helpers import load_clips_from_npz_dir
 
 # config for experiments, to toggle input features
 USE_MOTIONVECTORS = True   # include motion-vector stream
@@ -151,16 +151,47 @@ class ClipDataset(Dataset):
         for frame in clip.frames:
 
             if USE_MOTIONVECTORS:
-                # MV_STRUCT flat array [H_tokens * W_tokens] → [4, H_tokens, W_tokens]
-                n_mv   = len(frame.motion_vectors)
-                h_mv   = int(round(n_mv ** 0.5))   # assumes square token grid
-                w_mv   = n_mv // h_mv
+                mv = frame.motion_vectors
+
+                if mv.ndim == 1:
+                    # flat format: [H*W]
+                    n_mv = len(mv)
+                    h_mv = int(round(n_mv ** 0.5))
+                    if h_mv * h_mv != n_mv:
+                        raise ValueError(
+                            f"Flat motion_vectors length {n_mv} is not a square grid"
+                        )
+                    w_mv = h_mv
+
+                elif mv.ndim == 2:
+                    # grid format: [H, W]
+                    h_mv, w_mv = mv.shape
+
+                elif mv.ndim == 3:
+                    # grid with singleton channel: [H, W, 1]
+                    if mv.shape[-1] != 1:
+                        raise ValueError(
+                            f"Unexpected 3D motion_vectors shape: {mv.shape} "
+                            f"(expected last dim == 1)"
+                        )
+                    mv = mv[..., 0]
+                    h_mv, w_mv = mv.shape
+
+                else:
+                    raise ValueError(
+                        f"Unexpected motion_vectors ndim: {mv.ndim}, shape={mv.shape}"
+                    )
+
                 mv_grid = np.stack([
-                    frame.motion_vectors['source'].astype(np.float32),
-                    frame.motion_vectors['motion_x'].astype(np.float32),
-                    frame.motion_vectors['motion_y'].astype(np.float32),
-                    frame.motion_vectors['motion_scale'].astype(np.float32),
-                ], axis=0).reshape(4, h_mv, w_mv)
+                    mv['source'].astype(np.float32),
+                    mv['motion_x'].astype(np.float32),
+                    mv['motion_y'].astype(np.float32),
+                    mv['motion_scale'].astype(np.float32),
+                ], axis=0)
+
+                if mv.ndim == 1:
+                    mv_grid = mv_grid.reshape(4, h_mv, w_mv)
+
                 mv_list.append(torch.from_numpy(mv_grid))
 
             if USE_RESIDUALS:
@@ -241,16 +272,20 @@ def build_data_loaders(
     """
     if clips is not None:
         pass  # use as-is
+
     elif npz_dir is not None:
-        npz_files = sorted(
-            os.path.join(npz_dir, f)
-            for f in os.listdir(npz_dir)
-            if f.endswith(".npz")
+        clips = load_clips_from_npz_dir(
+            npz_dir=npz_dir,
+            clip_length=clip_length,
+            stride=clip_length,
+            snap_to_iframe=True,
+            max_files=1,   # None for full loading
         )
-        if not npz_files:
-            raise FileNotFoundError(f"No .npz files found in {npz_dir}")
-        print(f"[DataLoader] Loading {len(npz_files)} clips from {npz_dir} ...")
-        clips = [import_clip(p) for p in npz_files]
+
+        if not clips:
+            raise ValueError(f"No clips could be created from {npz_dir}")
+
+        print(f"[DataLoader] Loaded {len(clips)} clips from {npz_dir} ...")
     else:
         print("[DataLoader] No data provided - generating dummy clip dataset ...")
         clips = build_dummy_dataset(n=200, clip_length=clip_length)
@@ -278,12 +313,12 @@ def build_data_loaders(
 if __name__ == "__main__":
     print(f"[DataLoader] Streams active: motion_vectors={USE_MOTIONVECTORS}  residuals={USE_RESIDUALS}")
 
-    train_loader, val_loader, test_loader = build_data_loaders()
+    train_loader, val_loader, test_loader = build_data_loaders(npz_dir="downloaded_videos/")
 
     print(f"  Split sizes  |  train={len(train_loader.dataset)}" # type: ignore
           f"  val={len(val_loader.dataset)}" # type: ignore
           f"  test={len(test_loader.dataset)}") # type: ignore
-    print(f"  Batches/epoch (train): {len(train_loader)}")
+    print(f"  Batches (train): {len(train_loader)}")
 
     # Inspect first training batch
     batch = next(iter(train_loader))

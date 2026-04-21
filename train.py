@@ -123,7 +123,7 @@ def compute_loss(
     used_queries = pred_boxes.new_zeros(B, num_queries, dtype=torch.bool)
 
     valid_frames = 0
-    
+
     for t in range(T):
 
 
@@ -150,12 +150,12 @@ def compute_loss(
         best_q = class_scores.argmax(dim=1)  # [B]
 
         # Mark these queries as used
-        used_queries[torch.arange(B), best_q] = True
+        used_queries[batch_idx, best_q] = True
 
         # Gather predictions for the matched queries
         # pred_boxes[b, best_q[b], :] for each b
-        matched_boxes   = pred_boxes[torch.arange(B), best_q]    # [B, 4]
-        matched_logits  = pred_classes[torch.arange(B), best_q]  # [B, num_classes]
+        matched_boxes   = pred_boxes[batch_idx, best_q]    # [B, 4]
+        matched_logits  = pred_classes[batch_idx, best_q]  # [B, num_classes]
 
         # Losses
         total_l1   = total_l1   + F.l1_loss(matched_boxes, gt_box_valid) # bbox loss

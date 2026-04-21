@@ -201,6 +201,7 @@ def train_one_epoch(
     cfg_loss:   dict,
     cfg_train:  dict,
     device:     torch.device,
+    scaler:     torch.cuda.amp.GradScaler
 ) -> dict:
 
     # model train
@@ -229,17 +230,20 @@ def train_one_epoch(
 
         # forward calculation
         optimizer.zero_grad()
-        pred_boxes, pred_classes = model(mv, res, ft_sequence)
 
-        # loss
-        loss, parts = compute_loss(pred_boxes, pred_classes, gt_boxes, gt_classes, cfg_loss)
-        loss.backward()
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            pred_boxes, pred_classes = model(mv, res, ft_sequence)
+            loss, parts = compute_loss(pred_boxes, pred_classes, gt_boxes, gt_classes, cfg_loss)
 
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         # Gradient clipping, needed for stable training of transformers.  Clip to 1.0 by default, but configurable via YAML. should be tested. could also be rm if not needed...
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg_train.get("grad_clip", 1.0))
 
         # optimizer step
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
+
 
         # Update totals
         for k, v in parts.items():
@@ -298,12 +302,15 @@ def validate(
 
         # forward + latency measurement
         t0 = time.perf_counter()
-        pred_boxes, pred_classes = model(mv, res, ft_sequence)
+
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            pred_boxes, pred_classes = model(mv, res, ft_sequence)
+            loss, parts = compute_loss(pred_boxes, pred_classes, gt_boxes, gt_classes, cfg_loss)
+
         latency_total += time.perf_counter() - t0
         n_frames      += gt_boxes.shape[0] * T
 
         # Loss
-        loss, parts = compute_loss(pred_boxes, pred_classes, gt_boxes, gt_classes, cfg_loss)
         for k, v in parts.items():
             totals[k] += v
         n_batches += 1
@@ -377,6 +384,11 @@ def main(config_path: str, resume: str | None = None) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # check for gpu, else cpu. ailab is CUDA.
     print(f"[train] Device: {device}  |  Experiment: {exp_name}") # print device and experiment name for debug
 
+        # mixed prec:
+
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+
+
     #  Build model 
     frame_h = cfg_data["frame_h"]
     frame_w = cfg_data["frame_w"]
@@ -405,25 +417,13 @@ def main(config_path: str, resume: str | None = None) -> None:
     stride      = cfg_data.get("stride", clip_length)
     snap        = cfg_data.get("snap_to_iframe", True)
 
-    # check if data directory is set, if not use dummy data for test
-    if npz_dir is not None:
-        clips = load_clips_from_npz_dir(
-            npz_dir=npz_dir,
-            clip_length=clip_length,
-            stride=stride,
-            snap_to_iframe=snap,
-            max_files=cfg_data.get("max_files"),  # optional, good for smoke tests
-        )
-    else:
-        # Fall back to dummy data for quick tests/ debugg
-        print("[train] npz_dir not set — using dummy clips for test")
-        clips = None
-
     # set up data loaders
-    train_loader, val_loader, _ = build_data_loaders(
-        clips      = clips,
-        clip_length = clip_length,
-    )
+    train_loader, val_loader, test_loader = build_data_loaders(
+            npz_dir=cfg["data"]["npz_dir"],
+            clip_length=cfg["data"]["clip_length"],
+            stride=cfg["data"]["stride"],   
+            snap_to_iframe=cfg["data"]["snap_to_iframe"]
+        )
 
     # debug
     batch = next(iter(train_loader))
@@ -478,7 +478,7 @@ def main(config_path: str, resume: str | None = None) -> None:
         t_start = time.time()
 
         train_losses = train_one_epoch(
-            model, train_loader, optimizer, cfg_loss, cfg_train, device
+            model, train_loader, optimizer, cfg_loss, cfg_train, device, scaler
         )
 
         val_losses, val_metrics = validate(

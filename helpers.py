@@ -272,9 +272,11 @@ def build_window_index(
     clip_length: int,
     stride: int,
     snap_to_iframe: bool = True,
+    filter_empty: bool = False,
 ) -> list[tuple[int, int]]:
     index = []
     skipped = 0
+    filtered = 0
 
     for clip_idx, clip in enumerate(long_clips):
         frames = clip.frames
@@ -306,6 +308,13 @@ def build_window_index(
                 dedup.append(start)
 
         for start in dedup:
+            
+            if filter_empty:
+                window_frames = frames[start : start + clip_length]
+                if all(f.true_class == -1 for f in window_frames):
+                    filtered += 1
+                    continue
+            
             index.append((clip_idx, start))
 
     print(
@@ -313,5 +322,6 @@ def build_window_index(
         f"{len(index)} clips  "
         f"(clip_length={clip_length}, stride={stride}, "
         f"snap_to_iframe={snap_to_iframe}, skipped={skipped} too-short videos)"
+        f"filtered={filtered} empty)"
     )
     return index

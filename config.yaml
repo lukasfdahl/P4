@@ -1,0 +1,69 @@
+# config.yaml  –  experiment configuration for ObjectDetector training
+
+# Copy and rename this file per experiment, e.g. "exp01_test1.yaml".
+# train.py loads this file and logs its full contents to the run directory
+# so every checkpoint is reproducible.
+
+experiment_name: "test123"
+
+# Model architecture
+# All values here are forwarded directly to ObjectDetector.__init__()
+
+model:
+  num_classes:        10       # must match your dataset, i think we have 23?
+  scales:             [8, 16, 32]
+  base_mv_scale:      16       # native H.264 MV block size — don't change
+  clip_length:        5        # frames per forward pass — must match data.clip_length
+  hidden_dim:         256
+  num_heads:          8
+  num_encoder_layers: 4
+  num_decoder_layers: 4
+  # ffn_dim defaults to 4 * hidden_dim if omitted
+  # expected_h/w_tokens are extracted automatically from frame_h/w and min(scales)
+
+
+# Data pipeline
+data:
+  npz_dir:          "downloaded_videos/"   # directory of .npz files from extractor.py
+  frame_h:          64
+  frame_w:          64
+  clip_length:      5          # must match model.clip_length
+  stride:           2          # sliding-window stride (frames).
+                               # stride=clip_length → no overlap (fastest)
+                               # stride=1           → maximum overlap (slowest, most clips)
+  snap_to_iframe:   true       # start each window on an I-frame when possible
+  use_motionvectors: true
+  use_residuals:    true
+  train_ratio:      0.8
+  val_ratio:        0.1
+  test_ratio:       0.1
+  max_files:        1
+
+# Training loop
+training:
+  epochs:        1
+  batch_size:    1
+  seed:          42
+  num_workers:   4
+  lr:            1.0e-4
+  weight_decay:  1.0e-4
+  grad_clip:     1.0           # max gradient norm — important for transformer stability
+
+  # Learning-rate scheduler
+  # "cosine" → CosineAnnealingLR over all epochs
+  # "plateau" → ReduceLROnPlateau (monitors val loss)
+  scheduler:     "cosine"
+  warmup_epochs: 3             # linear LR warm-up before the main scheduler kicks in
+
+# Loss function
+# bbox loss = l1_weight * L1  +  giou_weight * GIoU
+# All three weights can be set to 0.0 to disable that term.
+loss:
+  class_weight:   1.0
+  bbox_l1_weight: 5.0          # DETR defaults
+  bbox_giou_weight: 2.0
+
+# Checkpointing & logging
+paths:
+  checkpoint_dir: "checkpoints/"
+  log_dir:        "runs/"

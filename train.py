@@ -122,7 +122,11 @@ def compute_loss(
 
     used_queries = pred_boxes.new_zeros(B, num_queries, dtype=torch.bool)
 
+    valid_frames = 0
+    
     for t in range(T):
+
+
         gt_cls_t = gt_classes[:, t]          # [B]
         gt_box_t = gt_boxes[:, t]            # [B, 4]
 

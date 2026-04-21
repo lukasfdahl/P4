@@ -177,7 +177,7 @@ class ClipDataset(Dataset):
 
         sample = {
             "frame_types": frame_types,                      # list[str], length T
-            "boxes":       torch.stack(boxes_list),          # [T, 2]
+            "boxes":       torch.stack(boxes_list),          # [T, 4]
             "true_class":  torch.stack(cls_list),            # [T]
         }
         if USE_MOTIONVECTORS:
@@ -193,7 +193,7 @@ def collate_fn(batch: list[dict]) -> dict:
 
     collated = {
         "frame_types": [s["frame_types"] for s in batch],
-        "boxes":       torch.stack([s["boxes"]      for s in batch]),  # (B, T, 2)
+        "boxes":       torch.stack([s["boxes"]      for s in batch]),  # (B, T, 4)
         "true_class":  torch.stack([s["true_class"] for s in batch]),  # (B, T)
     }
     if USE_MOTIONVECTORS:

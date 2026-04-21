@@ -23,14 +23,17 @@ collate_fn batches those into:
 
 # libraries
 import os
+import glob # Added for lazy loading
 import random
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from dataclasses import asdict
 
 from data_classes import Frame, Clip, MV_STRUCT
-from helpers import load_clips_from_npz_dir
+from helpers import load_clips_from_npz_dir, build_window_index
+from npz_importer import import_clip # Added to dynamically load clips
 
 # config for experiments, to toggle input features
 USE_MOTIONVECTORS = True   # include motion-vector stream
@@ -63,6 +66,43 @@ W_TOKENS = FRAME_W // BASE_MV_SCALE   # = 4  (MV grid width)
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+
+# --- LAZY LOADING HELPER ---
+def lazy_build_window_index(npz_files: list[str], clip_length: int, stride: int, snap_to_iframe: bool = True) -> list[tuple[int, int]]:
+    """Builds sliding windows by only reading the lightweight metadata of the NPZ files to save RAM."""
+    window_index = []
+    
+    for file_idx, file_path in enumerate(npz_files):
+        # FAST LOAD: Only load the frame_types string array, skip the heavy residuals
+        data = np.load(file_path)
+        frame_types = data["frame_types"]
+        n = len(frame_types)
+
+        if n < clip_length:
+            continue
+
+        starts = list(range(0, n - clip_length + 1, stride))
+        last_valid = n - clip_length
+        if starts and starts[-1] != last_valid:
+            starts.append(last_valid)
+
+        seen = set()
+        for start in starts:
+            if snap_to_iframe:
+                search_radius = stride // 2
+                best_start = start
+                for offset in range(-search_radius, search_radius + 1):
+                    idx = start + offset
+                    if 0 <= idx <= n - clip_length and frame_types[idx] == 'I':
+                        best_start = idx
+                        break
+                start = best_start
+
+            if start not in seen:
+                seen.add(start)
+                window_index.append((file_idx, start))
+                
+    return window_index
 
 # Dummy-data helpers for testing rn
 def _random_mv_grid(h_tokens: int = H_TOKENS, w_tokens: int = W_TOKENS) -> np.ndarray:
@@ -126,29 +166,52 @@ class ClipDataset(Dataset):
  
     def __init__(
         self,
-        clips:       list[Clip],
-        indices:     list[int],
+        source_data: list[str] | list[Clip], # Changed to accept file paths OR dummy clips
+        window_index: list[tuple[int, int]],
+        indices: list[int],
+        clip_length: int,
         base_mv_scale: int = BASE_MV_SCALE,
     ):
-        self.clips         = clips
-        self.indices       = indices
+        self.source_data = source_data
+        self.window_index = window_index
+        self.indices = indices
+        self.clip_length = clip_length
         self.base_mv_scale = base_mv_scale
+        
+        # RAM FIX test Worker-level cache so we only load files when needed
+        self.is_lazy = len(source_data) > 0 and isinstance(source_data[0], str)
+        self._current_path = None
+        self._current_clip = None
  
     def __len__(self) -> int:
         return len(self.indices)
  
     def __getitem__(self, idx: int) -> dict:
-        clip: Clip = self.clips[self.indices[idx]]
 
-        # Extract motion vectors, residuals, and annotations from the clip
         mv_list     = []
         res_list    = []
         frame_types = []
         boxes_list  = []
         cls_list    = []
 
+        sample_idx = self.indices[idx]
+        clip_idx, start = self.window_index[sample_idx]
+
+        # LAZY LOAD LOGIC
+        if self.is_lazy:
+            file_path = self.source_data[clip_idx]
+            if self._current_path != file_path:
+                self._current_clip = import_clip(file_path)
+                self._current_path = file_path
+            clip = self._current_clip
+        else:
+            # Fallback for dummy data
+            clip = self.source_data[clip_idx]
+
+        frames = clip.frames[start:start + self.clip_length]
+
         # Iterate over frames in the clip
-        for frame in clip.frames:
+        for frame in frames:
 
             if USE_MOTIONVECTORS:
                 mv = frame.motion_vectors
@@ -192,13 +255,32 @@ class ClipDataset(Dataset):
                 if mv.ndim == 1:
                     mv_grid = mv_grid.reshape(4, h_mv, w_mv)
 
-                mv_list.append(torch.from_numpy(mv_grid))
+                mv_tensor = torch.from_numpy(mv_grid)
+                
+                # RESIZE FIX: Force MVs to constant shape [4, H_TOKENS, W_TOKENS]
+                # We use 'nearest' because 'source' and 'motion_scale' are categorical numbers.
+                mv_tensor = F.interpolate(
+                    mv_tensor.unsqueeze(0), 
+                    size=(H_TOKENS, W_TOKENS), 
+                    mode='nearest'
+                ).squeeze(0)
+                
+                mv_list.append(mv_tensor)
 
             if USE_RESIDUALS:
                 # [H, W, 3] uint8 → [3, H, W] float32 in [0, 1]
                 res = torch.from_numpy(
                     frame.residuals.astype(np.float32) / 255.0
                 ).permute(2, 0, 1)
+                
+                # RESIZE FIX: Force Residuals to constant shape [3, FRAME_H, FRAME_W]
+                res = F.interpolate(
+                    res.unsqueeze(0), 
+                    size=(FRAME_H, FRAME_W), 
+                    mode='bilinear', 
+                    align_corners=False
+                ).squeeze(0)
+                
                 res_list.append(res)
 
             # annotations (always included)
@@ -236,17 +318,18 @@ def collate_fn(batch: list[dict]) -> dict:
 
 
 # helper to create dataset splits
-def _make_splits(n: int) -> dict[str, list[int]]:
-    indices = list(range(n))
-    random.shuffle(indices)
-    n_train = int(n * TRAIN_RATIO)
-    n_val   = int(n * VAL_RATIO)
-    return {
-        "train": indices[:n_train],
-        "val":   indices[n_train : n_train + n_val],
-        "test":  indices[n_train + n_val :],
-    }
+def _make_video_splits(n_videos: int) -> dict[str, set[int]]:
+    video_ids = list(range(n_videos))
+    random.shuffle(video_ids)
 
+    n_train = int(n_videos * TRAIN_RATIO)
+    n_val   = int(n_videos * VAL_RATIO)
+
+    return {
+        "train": set(video_ids[:n_train]),
+        "val":   set(video_ids[n_train:n_train + n_val]),
+        "test":  set(video_ids[n_train + n_val:]),
+    }
 
 
 #build dataloader?
@@ -254,12 +337,15 @@ def build_data_loaders(
     clips: list[Clip] | None = None,
     npz_dir: str | None = None,
     clip_length: int = CLIP_LENGTH,
-) -> tuple[DataLoader, DataLoader, DataLoader]:
+    stride: int = CLIP_LENGTH,         # <--- ADDED STRIDE
+    snap_to_iframe: bool = True,       # <--- ADDED SNAP
+    limit_1_video: bool = False,
+) -> tuple[DataLoader, DataLoader | list, DataLoader | list]:
     """
     Three ways to call this:
  
         build_data_loaders(npz_dir="/app/test/output_dir")
-            -> loads every .npz produced by extractor.py via import_data.import_clip()
+            -> loads every .npz produced by extractor.py via lazy loading paths
                this is the normal production path, and also used for training?
  
         build_data_loaders(clips=my_clip_list)
@@ -271,81 +357,104 @@ def build_data_loaders(
     Returns (train_loader, val_loader, test_loader).
     """
     if clips is not None:
-        pass  # use as-is
-
+        source_data = clips
+        if limit_1_video:
+            source_data = source_data[:1]
+        window_index = build_window_index(source_data, clip_length=clip_length, stride=stride, snap_to_iframe=snap_to_iframe)        
+    
     elif npz_dir is not None:
-        clips = load_clips_from_npz_dir(
-            npz_dir=npz_dir,
-            clip_length=clip_length,
-            stride=clip_length,
-            snap_to_iframe=True,
-            max_files=1,   # None for full loading
-        )
+        npz_files = sorted(glob.glob(os.path.join(npz_dir, "*.npz")))
+        if not npz_files:
+            raise ValueError(f"No .npz files found in {npz_dir}")
+            
+        if limit_1_video:
+            npz_files = npz_files[:1]
+            
+        source_data = npz_files
+        window_index = lazy_build_window_index(source_data, clip_length=clip_length, stride=stride, snap_to_iframe=snap_to_iframe)
 
-        if not clips:
-            raise ValueError(f"No clips could be created from {npz_dir}")
 
-        print(f"[DataLoader] Loaded {len(clips)} clips from {npz_dir} ...")
     else:
-        print("[DataLoader] No data provided - generating dummy clip dataset ...")
-        clips = build_dummy_dataset(n=200, clip_length=clip_length)
- 
-    splits = _make_splits(len(clips))
- 
-    train_ds = ClipDataset(clips, splits["train"])
-    val_ds   = ClipDataset(clips, splits["val"])
-    test_ds  = ClipDataset(clips, splits["test"])
- 
-    loader_kwargs = dict(
-        num_workers        = NUM_WORKERS,
-        pin_memory         = NUM_WORKERS > 0,
-        persistent_workers = NUM_WORKERS > 0,
-        prefetch_factor    = 2 if NUM_WORKERS > 0 else None,
-        collate_fn         = collate_fn,
-    )
- 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  **loader_kwargs) # type: ignore
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs) # type: ignore
-    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs) # type: ignore
- 
+        # Fallback dummy logic
+        source_data = build_dummy_dataset()
+        window_index = build_window_index(source_data, clip_length=clip_length, stride=clip_length, snap_to_iframe=True)
+
+    n_videos = len(source_data)
+
+    # Prevent crash and force data to train split if only 1 video
+    if n_videos == 1:
+        print("[DataLoader] Only 1 video detected. Forcing all clips to 'train' split to prevent crash.")
+        train_idx = list(range(len(window_index)))
+        val_idx   = []
+        test_idx  = []
+    else:
+        video_splits = _make_video_splits(n_videos)
+        train_idx = [i for i, (v_idx, _) in enumerate(window_index) if v_idx in video_splits["train"]]
+        val_idx   = [i for i, (v_idx, _) in enumerate(window_index) if v_idx in video_splits["val"]]
+        test_idx  = [i for i, (v_idx, _) in enumerate(window_index) if v_idx in video_splits["test"]]
+
+    train_ds = ClipDataset(source_data, window_index, train_idx, clip_length)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS, collate_fn=collate_fn)
+    
+    # Safely create val/test only if data exists
+    if val_idx:
+        val_ds   = ClipDataset(source_data, window_index, val_idx, clip_length)
+        val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, collate_fn=collate_fn)
+    else:
+        val_loader = []
+        
+    if test_idx:
+        test_ds  = ClipDataset(source_data, window_index, test_idx, clip_length)
+        test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, collate_fn=collate_fn)
+    else:
+        test_loader = []
+
     return train_loader, val_loader, test_loader
 
 if __name__ == "__main__":
     print(f"[DataLoader] Streams active: motion_vectors={USE_MOTIONVECTORS}  residuals={USE_RESIDUALS}")
 
-    train_loader, val_loader, test_loader = build_data_loaders(npz_dir="downloaded_videos/")
+    # Set limit_1_video=True so we only grab 1 video and trigger the split fix
+    train_loader, val_loader, test_loader = build_data_loaders(npz_dir="downloaded_videos/", limit_1_video=True)
+
+    # Handle potentially empty val/test loaders cleanly in prints
+    val_size = len(val_loader.dataset) if hasattr(val_loader, 'dataset') else 0
+    test_size = len(test_loader.dataset) if hasattr(test_loader, 'dataset') else 0
 
     print(f"  Split sizes  |  train={len(train_loader.dataset)}" # type: ignore
-          f"  val={len(val_loader.dataset)}" # type: ignore
-          f"  test={len(test_loader.dataset)}") # type: ignore
+          f"  val={val_size}" 
+          f"  test={test_size}") 
     print(f"  Batches (train): {len(train_loader)}")
 
-    # Inspect first training batch
-    batch = next(iter(train_loader))
+    if len(train_loader) > 0:
+        # Inspect first training batch
+        batch = next(iter(train_loader))
 
-    for key, val in batch.items():
-        if isinstance(val, torch.Tensor):
-            print(f"  {key:16s} | shape {str(tuple(val.shape)):20s} | dtype {val.dtype}")
-        else:
-            print(f"  {key:16s} | {val}")
+        for key, val in batch.items():
+            if isinstance(val, torch.Tensor):
+                print(f"  {key:16s} | shape {str(tuple(val.shape)):20s} | dtype {val.dtype}")
+            else:
+                print(f"  {key:16s} | {val}")
 
-    print()
-    print(f"  frame_types[0] (first clip): {batch['frame_types'][0]}")
-    print(f"  true_class[0]  (first clip): {batch['true_class'][0].tolist()}")
-    print()
+        print()
+        print(f"  frame_types[0] (first clip): {batch['frame_types'][0]}")
+        print(f"  true_class[0]  (first clip): {batch['true_class'][0].tolist()}")
+        print()
 
-    # test few times
-    print("Iterating through all train batches …", end=" ")
-    for i, b in enumerate(train_loader):
-        pass
-    print(f"done ({i+1} batches).\n") # type: ignore
+        # test few times
+        print("Iterating through all train batches …", end=" ")
+        for i, b in enumerate(train_loader):
+            pass
+        print(f"done ({i+1} batches).\n") # type: ignore
 
-    print("Iterating through all val batches …",   end=" ")
-    for i, b in enumerate(val_loader):
-        pass
-    print(f"done ({i+1} batches).\n") # type: ignore
+        if val_loader:
+            print("Iterating through all val batches …",   end=" ")
+            for i, b in enumerate(val_loader):
+                pass
+            print(f"done ({i+1} batches).\n") # type: ignore
 
-    print("Iterating through all test batches …",  end=" ")
-    for i, b in enumerate(test_loader):
-        pass
-    print(f"done ({i+1} batches).\n") # type: ignore
+        if test_loader:
+            print("Iterating through all test batches …",  end=" ")
+            for i, b in enumerate(test_loader):
+                pass
+            print(f"done ({i+1} batches).\n") # type: ignore

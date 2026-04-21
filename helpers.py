@@ -196,17 +196,13 @@ def xywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
 
 
 
-
 def load_clips_from_npz_dir(
     npz_dir: str,
-    clip_length: int,
-    stride: int,
-    snap_to_iframe: bool = True,
     max_files: int | None = None,
 ) -> list[Clip]:
     """
-    Load .npz videos from a directory, convert them to long Clip objects,
-    then split them into fixed-length clips with sliding_window.
+    Load .npz videos from a directory and convert them to long Clip objects
+    without windowing to prevent RAM explosion.
     """
     npz_files = sorted(
         os.path.join(npz_dir, f)
@@ -223,9 +219,99 @@ def load_clips_from_npz_dir(
     print(f"[helpers] Loading {len(npz_files)} videos from {npz_dir} ...")
 
     long_clips = [import_clip(p) for p in npz_files]
-    return clips_from_long_videos(
-        long_clips,
-        clip_length=clip_length,
-        stride=stride,
-        snap_to_iframe=snap_to_iframe,
+    return long_clips
+
+
+
+
+#ram isssue test
+
+def sliding_window_indices(
+    clip: Clip,
+    clip_length: int,
+    stride: int,
+    snap_to_iframe: bool = True,
+) -> list[int]:
+    frames = clip.frames
+    n = len(frames)
+
+    if n < clip_length:
+        return []
+
+    candidate_starts = list(range(0, n - clip_length + 1, stride))
+    last_valid = n - clip_length
+    if candidate_starts[-1] != last_valid:
+        candidate_starts.append(last_valid)
+
+    starts = []
+    for start in candidate_starts:
+        if snap_to_iframe:
+            start = _snap_to_nearest_iframe(frames, start, stride)
+
+        end = start + clip_length
+        if end > n:
+            end = n
+            start = end - clip_length
+
+        starts.append(start)
+
+    # deduplicate after snapping
+    unique_starts = []
+    seen = set()
+    for s in starts:
+        if s not in seen:
+            seen.add(s)
+            unique_starts.append(s)
+
+    return unique_starts
+
+
+
+def build_window_index(
+    long_clips: list[Clip],
+    clip_length: int,
+    stride: int,
+    snap_to_iframe: bool = True,
+) -> list[tuple[int, int]]:
+    index = []
+    skipped = 0
+
+    for clip_idx, clip in enumerate(long_clips):
+        frames = clip.frames
+        n = len(frames)
+
+        if n < clip_length:
+            skipped += 1
+            continue
+
+        starts = list(range(0, n - clip_length + 1, stride))
+        last_valid = n - clip_length
+        if starts[-1] != last_valid:
+            starts.append(last_valid)
+
+        dedup = []
+        seen = set()
+
+        for start in starts:
+            if snap_to_iframe:
+                start = _snap_to_nearest_iframe(frames, start, stride)
+
+            end = start + clip_length
+            if end > n:
+                end = n
+                start = end - clip_length
+
+            if start not in seen:
+                seen.add(start)
+                dedup.append(start)
+
+        for start in dedup:
+            index.append((clip_idx, start))
+
+    print(
+        f"[helpers] sliding_window: {len(long_clips)} videos → "
+        f"{len(index)} clips  "
+        f"(clip_length={clip_length}, stride={stride}, "
+        f"snap_to_iframe={snap_to_iframe}, skipped={skipped} too-short videos)"
     )
+    return index

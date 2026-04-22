@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from scipy.optimize import linear_sum_assignment
 
 from model      import ObjectDetector
 from dataloader import build_data_loaders
@@ -82,92 +83,81 @@ def giou_loss(pred_boxes: torch.Tensor, gt_boxes: torch.Tensor) -> torch.Tensor:
 
 #compute both, cross entropy is just libary
 def compute_loss(
-    pred_boxes:   torch.Tensor,   # [B, num_queries, 4]  sigmoid output
-    pred_classes: torch.Tensor,   # [B, num_queries, num_classes]  logits
-    gt_boxes:     torch.Tensor,   # [B, T, 4]  [xmin, xmax, ymin, ymax]
-    gt_classes:   torch.Tensor,   # [B, T]  int64
+    pred_boxes:   torch.Tensor,   # [B, num_queries, 4]  
+    pred_classes: torch.Tensor,   # [B, num_queries, num_classes]  
+    gt_boxes:     torch.Tensor,   # [B, T, 4]  
+    gt_classes:   torch.Tensor,   # [B, T]  
     cfg_loss:     dict,
 ) -> tuple[torch.Tensor, dict]:
     
-    """
-    Match each GT box to the best (highest confidence) query, then compute:
-        • L1 loss on the matched box coordinates
-        • GIoU loss on the matched box coordinates
-        • Cross-entropy loss on the matched class logit vs true class
-
-    The model produces one set of queries for the whole clip (T frames),
-    and each frame has exactly one GT box.  We assign one unique query
-    per frame by picking the query with the highest predicted confidence
-    for that frame's GT class.
-
-    Parameters
-    pred_boxes   : [B, num_queries, 4]
-    pred_classes : [B, num_queries, num_classes]   (raw logits)
-    gt_boxes     : [B, T, 4]   normalised [xmin, xmax, ymin, ymax]
-    gt_classes   : [B, T]      int64 class index per frame
-
-    Returns
-    total_loss : scalar tensor
-    loss_parts : dict with individual loss values (for logging)
-    """
-
     B, num_queries, num_classes = pred_classes.shape
-    T = gt_boxes.shape[1]
+    
+    # Get weights
+    w_l1   = cfg_loss.get("bbox_l1_weight",   5.0)
+    w_giou = cfg_loss.get("bbox_giou_weight", 2.0)
+    w_cls  = cfg_loss.get("class_weight",     1.0)
 
-    # Confidence per query = softmax then take the score for the GT class
-    # Shape: [B, num_queries, num_classes]
-    probs = torch.softmax(pred_classes, dim=-1)  # [B, Q, C]
+    # Probabilities for class matching cost
+    probs = torch.softmax(pred_classes, dim=-1)
 
     total_l1   = pred_boxes.new_tensor(0.0)
     total_giou = pred_boxes.new_tensor(0.0)
     total_cls  = pred_boxes.new_tensor(0.0)
-
-    used_queries = pred_boxes.new_zeros(B, num_queries, dtype=torch.bool)
-
     valid_frames = 0
 
-    # Clean nested loop to avoid PyTorch advanced indexing dimension shifting
     for b in range(B):
-        for t in range(T):
-            gt_cls = gt_classes[b, t]
-
-            # Skip frames with no object (class == -1 sentinel)
-            if gt_cls == -1:
-                continue
-
-            gt_box = gt_boxes[b, t]
-
-            # For each batch item, find the query with the highest confidence
-            # for this frame's GT class (among queries not yet assigned).
-            class_scores = probs[b, :, gt_cls].clone()  # Shape: [num_queries]
-
-            # Mask out already-assigned queries (set their score to -1)
-            class_scores.masked_fill_(used_queries[b], -1.0)
-
-            best_q = class_scores.argmax(dim=0)  # Pick best query index
-
-            # Mark this query as used
-            used_queries[b, best_q] = True
-
-            # Gather predictions for the matched query
-            matched_box   = pred_boxes[b, best_q]      # [4]
-            matched_logit = pred_classes[b, best_q]    # [num_classes]
-
-            # Losses (unsqueeze adds a dummy batch dim of 1 to keep PyTorch safe)
-            total_l1   = total_l1   + F.l1_loss(matched_box, gt_box)
-            total_giou = total_giou + giou_loss(matched_box.unsqueeze(0), gt_box.unsqueeze(0)).squeeze()
-            total_cls  = total_cls  + F.cross_entropy(matched_logit.unsqueeze(0), gt_cls.unsqueeze(0)).squeeze()
-
+        # 1. Filter out padded/empty GT frames (where class == -1)
+        valid_mask = gt_classes[b] != -1
+        valid_gt_boxes = gt_boxes[b][valid_mask]      # [num_gt, 4]
+        valid_gt_classes = gt_classes[b][valid_mask]  # [num_gt]
+        
+        num_gt = valid_gt_boxes.shape[0]
+        if num_gt == 0:
+            continue
+            
+        # 2. Build the Cost Matrix [num_queries, num_gt]
+        # Class cost: We want to MAXIMIZE probability, so cost is negative probability
+        out_prob = probs[b] 
+        cost_class = -out_prob[:, valid_gt_classes] 
+        
+        # L1 Bounding Box Cost: pairwise distance
+        cost_l1 = torch.cdist(pred_boxes[b], valid_gt_boxes, p=1)
+        
+        # GIoU Cost: pairwise loop
+        cost_giou = torch.zeros((num_queries, num_gt), device=pred_boxes.device)
+        for i in range(num_queries):
+            for j in range(num_gt):
+                # giou_loss expects matching shapes, so we unsqueeze to add dummy batch dim
+                cost_giou[i, j] = giou_loss(
+                    pred_boxes[b, i].unsqueeze(0), 
+                    valid_gt_boxes[j].unsqueeze(0)
+                ).squeeze()
+                
+        # 3. Combine into final Cost Matrix and move to CPU for SciPy
+        C = (w_cls * cost_class) + (w_l1 * cost_l1) + (w_giou * cost_giou)
+        C_np = C.detach().cpu().numpy()
+        
+        # 4. HUNGARIAN MATCHER (Bipartite Matching)
+        row_ind, col_ind = linear_sum_assignment(C_np)
+        
+        # 5. Compute actual Loss using the optimal assignments
+        for q_idx, gt_idx in zip(row_ind, col_ind):
+            matched_box = pred_boxes[b, q_idx]
+            matched_logit = pred_classes[b, q_idx]
+            actual_gt_box = valid_gt_boxes[gt_idx]
+            actual_gt_cls = valid_gt_classes[gt_idx]
+            
+            total_l1   += F.l1_loss(matched_box, actual_gt_box)
+            total_giou += giou_loss(matched_box.unsqueeze(0), actual_gt_box.unsqueeze(0)).squeeze()
+            total_cls  += F.cross_entropy(matched_logit.unsqueeze(0), actual_gt_cls.unsqueeze(0)).squeeze()
+            
             valid_frames += 1
 
     # Safe return if the entire batch happens to be empty clips
     if valid_frames == 0:
         zero = (pred_boxes * 0).sum() + (pred_classes * 0).sum()
         return zero, {
-            "loss_total": 0.0,
-            "loss_cls": 0.0,
-            "loss_l1": 0.0,
-            "loss_giou": 0.0,
+            "loss_total": 0.0, "loss_cls": 0.0, "loss_l1": 0.0, "loss_giou": 0.0
         }
 
     # Average over valid frames
@@ -175,17 +165,13 @@ def compute_loss(
     total_giou = total_giou / valid_frames
     total_cls  = total_cls  / valid_frames
 
-    w_l1   = cfg_loss.get("bbox_l1_weight",   5.0)
-    w_giou = cfg_loss.get("bbox_giou_weight", 2.0)
-    w_cls  = cfg_loss.get("class_weight",     1.0)
-
-    total = w_cls * total_cls + w_l1 * total_l1 + w_giou * total_giou
+    total = (w_cls * total_cls) + (w_l1 * total_l1) + (w_giou * total_giou)
 
     return total, {
         "loss_total": total.item(),
-        "loss_cls":   total_cls.item(),
-        "loss_l1":    total_l1.item(),
-        "loss_giou":  total_giou.item(),
+        "loss_cls":   (w_cls * total_cls).item(),
+        "loss_l1":    (w_l1 * total_l1).item(),
+        "loss_giou":  (w_giou * total_giou).item(),
     }
 
 

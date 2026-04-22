@@ -216,6 +216,7 @@ def evaluate(
 
     # accuracy and mean IoU 
     total_fn = 0
+    total_tp = 0
     tp_ious: List[float] = []
 
     for preds, gts in zip(predictions, ground_truth):

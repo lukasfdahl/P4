@@ -21,6 +21,8 @@ from helpers import (
 from eval_framwork import BoundingBox, Prediction, evaluate
 from npz_importer   import import_clip
 
+import mlflow
+import os
 
 
 #list of things for train.py
@@ -361,6 +363,9 @@ def validate(
 # Main entry point
 def main(config_path: str, resume: str | None = None) -> None:
 
+    # This tells MLflow to automatically log CPU, RAM, and GPU usage
+    os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "true"
+
     # Load config
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
@@ -381,7 +386,29 @@ def main(config_path: str, resume: str | None = None) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # check for gpu, else cpu. ailab is CUDA.
     print(f"[train] Device: {device}  |  Experiment: {exp_name}") # print device and experiment name for debug
 
-        # mixed prec:
+    # mlflow
+    exp_name = cfg.get("experiment_name", "experiment")
+    
+    # Optional: Set tracking URI if your MLflow server is running on a specific host/port
+    # If running locally in the same folder, it defaults to a local ./mlruns directory
+    mlflow.set_tracking_uri("http://localhost:8080") 
+    mlflow.set_experiment(exp_name)
+
+    # Start the MLflow run
+    with mlflow.start_run(run_name="training_run_01"):
+        
+        # Log your entire config as a dictionary so you know exactly what parameters were used
+        mlflow.log_dict(cfg, "config.yaml")
+        
+        # You can also log specific high-level params for easier sorting in the UI
+        mlflow.log_params({
+            "lr": cfg_train["lr"],
+            "epochs": cfg_train["epochs"],
+            "clip_length": cfg_data["clip_length"],
+            "batch_size": cfg_train.get("batch_size", "unknown")
+        })
+    
+    # mixed prec:
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
@@ -419,7 +446,8 @@ def main(config_path: str, resume: str | None = None) -> None:
             npz_dir=cfg["data"]["npz_dir"],
             clip_length=cfg["data"]["clip_length"],
             stride=cfg["data"]["stride"],   
-            snap_to_iframe=cfg["data"]["snap_to_iframe"]
+            snap_to_iframe=cfg["data"]["snap_to_iframe"],
+            max_files=cfg["data"].get("max_files")
         )
 
     # debug
@@ -481,9 +509,13 @@ def main(config_path: str, resume: str | None = None) -> None:
             model, train_loader, optimizer, cfg_loss, cfg_train, device, scaler
         )
 
-        val_losses, val_metrics = validate(
-            model, val_loader, cfg_loss, device, cfg_model["num_classes"]
-        )
+        if val_loader:
+            val_losses, val_metrics = validate(model, val_loader, cfg_loss, device, cfg_model["num_classes"])
+        else:
+            print("  [train] No validation data, skipping validate()")
+            # use dummy values so the rest of the loop doesn't crash
+            val_losses = {"loss_total": 0.0, "loss_cls": 0.0, "loss_l1": 0.0, "loss_giou": 0.0}
+            val_metrics = None
 
         # Step scheduler (warm-up + cosine are both stepped per epoch)
         if sched_type == "plateau":
@@ -502,9 +534,34 @@ def main(config_path: str, resume: str | None = None) -> None:
             f"l1 {train_losses['loss_l1']:.3f} "
             f"giou {train_losses['loss_giou']:.3f}) "
             f"| val_loss {val_losses['loss_total']:.4f} "
+        )
+
+        metrics_to_log = {
+                "train_loss_total": train_losses["loss_total"],
+                "train_loss_cls": train_losses["loss_cls"],
+                "train_loss_l1": train_losses["loss_l1"],
+                "train_loss_giou": train_losses["loss_giou"],
+                "val_loss_total": val_losses["loss_total"],
+                "learning_rate": lr_now
+            }
+
+        if val_loader:
+            metrics_to_log.update({
+                "val_accuracy": val_metrics.accuracy,
+                "val_mAP_50": val_metrics.mAP_50,
+                "val_IoU": val_metrics.iou
+            })
+
+        mlflow.log_metrics(metrics_to_log, step=epoch)
+        
+        if val_loader:
+            print(
             f"| acc {val_metrics.accuracy:.3f} "
             f"| mAP50 {val_metrics.mAP_50:.3f} "
             f"| IoU {val_metrics.iou:.3f} "
+            )
+
+        print(
             f"| lr {lr_now:.2e} "
             f"| {elapsed:.1f}s"
         )
@@ -540,6 +597,8 @@ def main(config_path: str, resume: str | None = None) -> None:
             )
             print(f"  ↳ New best val_loss {best_val_loss:.4f} — saved to {best_path}")
 
+            mlflow.log_artifact(best_path, artifact_path="models")
+
     print(f"\n[train] Done. Best val_loss: {best_val_loss:.4f}")
 
 
@@ -550,3 +609,10 @@ if __name__ == "__main__":
         config_path = "config.yaml",
         resume      = None,
     )
+
+
+#mlflow server --host 127.0.0.1 --port 8080 
+#for local pc tetst in other terminal
+
+#kill 
+# lsof -ti:8080 | xargs kill -9

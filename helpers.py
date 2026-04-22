@@ -321,7 +321,7 @@ def build_window_index(
         f"[helpers] sliding_window: {len(long_clips)} videos → "
         f"{len(index)} clips  "
         f"(clip_length={clip_length}, stride={stride}, "
-        f"snap_to_iframe={snap_to_iframe}, skipped={skipped} too-short videos)"
+        f"snap_to_iframe={snap_to_iframe}, skipped={skipped} too-short videos), "
         f"filtered={filtered} empty)"
     )
     return index

@@ -8,7 +8,7 @@ __getitem__ returns:
     motion_vectors : [T, 4, H_tokens, W_tokens]   (float32)   – if USE_MOTIONVECTORS
     residuals      : [T, 3, H, W]                  (float32, normalised to [0,1])  – if USE_RESIDUALS
     frame_types    : list[str]  length T
-    boxes          : [T, 2]    float32  [xmin, xmax] per frame
+    boxes          : [T, 4]    float32  [xmin, xmax] per frame
     true_class     : [T]       int64    class label per frame
  
 collate_fn batches those into:
@@ -349,9 +349,10 @@ def build_data_loaders(
     clips: list[Clip] | None = None,
     npz_dir: str | None = None,
     clip_length: int = CLIP_LENGTH,
-    stride: int = CLIP_LENGTH,         # <--- ADDED STRIDE
-    snap_to_iframe: bool = True,       # <--- ADDED SNAP
+    stride: int = CLIP_LENGTH,
+    snap_to_iframe: bool = True,
     limit_1_video: bool = False,
+    max_files: int | None = None
 ) -> tuple[DataLoader, DataLoader | list, DataLoader | list]:
     """
     Three ways to call this:
@@ -378,6 +379,9 @@ def build_data_loaders(
         npz_files = sorted(glob.glob(os.path.join(npz_dir, "*.npz")))
         if not npz_files:
             raise ValueError(f"No .npz files found in {npz_dir}")
+
+        if max_files is not None:
+            npz_files = npz_files[:max_files]
             
         if limit_1_video:
             npz_files = npz_files[:1]

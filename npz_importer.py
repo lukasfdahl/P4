@@ -14,8 +14,8 @@ MV_STRUCT = np.dtype([
     ('motion_scale', np.int32)
 ])
 
-dataset_labels_path = "dataset/youtube_boundingboxes_detection_train.csv"
-dataset_download_url = "https://research.google.com/youtube-bb/yt_bb_detection_train.csv.gz"
+dataset_labels_path = "dataset/master_yt_bb_detection.csv"
+dataset_download_url = "https://research.google.com/youtube-bb/yt_bb_detection_train.csv.gz" #also handled now in download.py
 column_names = ["youtube_id",
                 "timestamp_ms",
                 "class_id",

@@ -352,7 +352,9 @@ def build_data_loaders(
     stride: int = CLIP_LENGTH,
     snap_to_iframe: bool = True,
     limit_1_video: bool = False,
-    max_files: int | None = None
+    max_files: int | None = None,
+    batch_size: int = BATCH_SIZE,
+    num_workers: int = NUM_WORKERS,
 ) -> tuple[DataLoader, DataLoader | list, DataLoader | list]:
     """
     Three ways to call this:
@@ -418,18 +420,18 @@ def build_data_loaders(
         test_idx  = [i for i, (v_idx, _) in enumerate(window_index) if v_idx in video_splits["test"]]
 
     train_ds = ClipDataset(source_data, window_index, train_idx, clip_length)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS, collate_fn=collate_fn)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers, collate_fn=collate_fn)
     
     # Safely create val/test only if data exists
     if val_idx:
         val_ds   = ClipDataset(source_data, window_index, val_idx, clip_length)
-        val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, collate_fn=collate_fn)
+        val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
     else:
         val_loader = []
         
     if test_idx:
         test_ds  = ClipDataset(source_data, window_index, test_idx, clip_length)
-        test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, collate_fn=collate_fn)
+        test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
     else:
         test_loader = []
 

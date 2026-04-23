@@ -308,37 +308,40 @@ def validate(
 
         # Collect predictions
         for b in range(B):
+            # Find the first valid GT frame in this clip (clip has one pred set, not per-frame)
+            valid_t = None
             for t in range(T):
-                # Ground truth
-                box = gt_boxes[b, t].cpu()
-                cls = gt_classes[b, t].item()
+                if gt_classes[b, t].item() != -1:
+                    valid_t = t
+                    break
 
-                # Skip frames with no object (class == -1, bbox == -1 sentinel)
-                if cls == -1:
-                    continue
+            # Skip clips with no annotated frames at all
+            if valid_t is None:
+                continue
 
-                gt_frame = [BoundingBox(
-                    xmin=box[0].item(), xmax=box[1].item(),
-                    ymin=box[2].item(), ymax=box[3].item(),
-                    class_id=int(cls),
-                )]
+            box = gt_boxes[b, valid_t].cpu()
+            cls = gt_classes[b, valid_t].item()
 
-                # Pick the top-k queries by confidence as predictions for this frame
-                # We use the single highest-confidence query per frame to keep eval simple.
-                conf_for_frame, best_cls_per_query = probs[b].max(dim=-1)  # [Q], [Q]
-                best_q = conf_for_frame.argmax().item()
+            gt_frame = [BoundingBox(
+                xmin=box[0].item(), xmax=box[1].item(),
+                ymin=box[2].item(), ymax=box[3].item(),
+                class_id=int(cls),
+            )]
 
-                pb = pred_boxes[b, best_q].cpu()
-                pred_frame = [Prediction(
-                    xmin=pb[0].item(), xmax=pb[1].item(),
-                    ymin=pb[2].item(), ymax=pb[3].item(),
-                    class_id=int(best_cls_per_query[best_q].item()),
-                    confidence=conf_for_frame[best_q].item(),
-                )]
+            # Pick the single highest-confidence query across all queries for this clip
+            conf_for_frame, best_cls_per_query = probs[b].max(dim=-1)  # [Q], [Q]
+            best_q = conf_for_frame.argmax().item()
 
-                # Store for metrics calculation after the epoch
-                all_predictions.append(pred_frame)
-                all_ground_truth.append(gt_frame)
+            pb = pred_boxes[b, best_q].cpu()
+            pred_frame = [Prediction(
+                xmin=pb[0].item(), xmax=pb[1].item(),
+                ymin=pb[2].item(), ymax=pb[3].item(),
+                class_id=int(best_cls_per_query[best_q].item()),
+                confidence=conf_for_frame[best_q].item(),
+            )]
+
+            all_predictions.append(pred_frame)
+            all_ground_truth.append(gt_frame)
 
     avg_latency = latency_total / max(n_frames, 1)
     metrics     = evaluate(all_predictions, all_ground_truth, latency=avg_latency)
@@ -433,7 +436,9 @@ def main(config_path: str, resume: str | None = None) -> None:
             clip_length=cfg["data"]["clip_length"],
             stride=cfg["data"]["stride"],   
             snap_to_iframe=cfg["data"]["snap_to_iframe"],
-            max_files=cfg["data"].get("max_files")
+            max_files=cfg["data"].get("max_files"),
+            batch_size=cfg_train["batch_size"],
+            num_workers=cfg_train.get("num_workers", 0),
         )
 
     # debug

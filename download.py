@@ -48,7 +48,7 @@ CONFIG = {
         }
     ],
     # Path to cookies file. If it doesn't exist, the script safely ignores it.
-    "COOKIES_FILE":    "youtube_cookies.txt",
+    "COOKIES_FILE":    "my_cookies_.txt",
 
     "SEGMENT_PADDING": 1.0,            # seconds of extra context around annotation
     "FRAME_H":         64,

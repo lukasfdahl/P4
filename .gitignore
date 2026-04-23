@@ -11,6 +11,8 @@ checkpoints/
 model_graph.png
 mlruns/
 
+/import
+
 # C extensions
 *.so
 

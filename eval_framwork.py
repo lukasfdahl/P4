@@ -1,6 +1,10 @@
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import numpy as np
 
 
 # Data containers
@@ -272,6 +276,93 @@ def evaluate(
         weighted_precision=weighted_precision,
         latency=latency,
     )
+
+
+# Visualisation
+def visualize_predictions(
+    predictions:  List[List[Prediction]],
+    ground_truth: List[List[BoundingBox]],
+    frame_images: List = None,
+    max_frames:   int  = 4,
+    save_path:    str  = None,
+    class_names:  Dict[int, str] = None,
+) -> None:
+    """
+    Draw GT (green) and predicted (red) bounding boxes for up to `max_frames` frames.
+    """
+
+    matplotlib.use("Agg" if save_path else "TkAgg")
+    
+    n_frames = len(predictions)
+    if n_frames == 0:
+        print("[eval] visualize_predictions: no frames to show.")
+        return
+
+    # Pick evenly-spaced frame indices
+    indices = [int(i) for i in np.linspace(0, n_frames - 1, min(max_frames, n_frames))]
+
+    fig, axes = plt.subplots(1, len(indices), figsize=(5 * len(indices), 5))
+    if len(indices) == 1:
+        axes = [axes]
+
+    for ax, idx in zip(axes, indices):
+        # Background image or blank canvas
+        if frame_images is not None and idx < len(frame_images):
+            img = np.array(frame_images[idx])
+            h, w = img.shape[:2]
+            ax.imshow(img)
+        else:
+            h, w = 256, 256
+            ax.imshow(np.full((h, w, 3), 200, dtype=np.uint8))
+
+        def _draw_box(box, color, label):
+            # Convert normalised [xmin, xmax, ymin, ymax] → pixel rect
+            x0 = box.xmin * w
+            y0 = box.ymin * h
+            bw = (box.xmax - box.xmin) * w
+            bh = (box.ymax - box.ymin) * h
+            rect = patches.Rectangle(
+                (x0, y0), bw, bh,
+                linewidth=2, edgecolor=color, facecolor="none",
+            )
+            ax.add_patch(rect)
+            ax.text(
+                x0, max(y0 - 4, 0), label,
+                color=color, fontsize=8,
+                bbox=dict(facecolor="white", alpha=0.5, pad=1, edgecolor="none"),
+            )
+
+        # Draw GT boxes (green)
+        for gt in ground_truth[idx]:
+            name = (class_names or {}).get(gt.class_id, f"cls {gt.class_id}")
+            _draw_box(gt, color="lime", label=f"GT: {name}")
+
+        # Draw predicted boxes (red)
+        for pred in predictions[idx]:
+            name = (class_names or {}).get(pred.class_id, f"cls {pred.class_id}")
+            iou_vals = [_compute_iou(pred, gt) for gt in ground_truth[idx]] if ground_truth[idx] else [0.0]
+            best_iou = max(iou_vals) if iou_vals else 0.0
+            _draw_box(pred, color="red", label=f"Pred: {name} {pred.confidence:.2f} IoU:{best_iou:.2f}")
+
+        ax.set_title(f"Frame {idx}", fontsize=10)
+        ax.axis("off")
+
+    # Legend
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color="lime", linewidth=2, label="Ground Truth"),
+        Line2D([0], [0], color="red",  linewidth=2, label="Prediction"),
+    ]
+    fig.legend(handles=legend_elements, loc="lower center", ncol=2, fontsize=9)
+    fig.suptitle("Prediction Visualisation", fontsize=12, y=1.01)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight", dpi=150)
+        print(f"[eval] Saved visualisation → {save_path}")
+        plt.close(fig)
+    else:
+        plt.show()
 
 
 # Self-test  (python eval_framework.py)

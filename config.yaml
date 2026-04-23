@@ -10,7 +10,7 @@ experiment_name: "test123"
 # All values here are forwarded directly to ObjectDetector.__init__()
 
 model:
-  num_classes:        23       # must match your dataset, i think we have 23?
+  num_classes:        1       # must match your dataset, i think we have 23?
   scales:             [8, 16, 32]
   base_mv_scale:      16       # native H.264 MV block size — don't change
   clip_length:        5        # frames per forward pass — must match data.clip_length
@@ -41,19 +41,19 @@ data:
 
 # Training loop
 training:
-  epochs:        2
+  epochs:        50
   batch_size:    8
   seed:          42
   num_workers:   4
   lr:            1.0e-4
-  weight_decay:  1.0e-4
+  weight_decay:  0
   grad_clip:     1.0           # max gradient norm — important for transformer stability
 
   # Learning-rate scheduler
   # "cosine" → CosineAnnealingLR over all epochs
   # "plateau" → ReduceLROnPlateau (monitors val loss)
   scheduler:     "cosine"
-  warmup_epochs: 3             # linear LR warm-up before the main scheduler kicks in
+  warmup_epochs: 2             # linear LR warm-up before the main scheduler kicks in
 
 # Loss function
 # bbox loss = l1_weight * L1  +  giou_weight * GIoU

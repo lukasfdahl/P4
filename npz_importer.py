@@ -81,8 +81,8 @@ def import_clip(clip_path : str) -> Clip:
             has_object = True
             row = frame_labels.iloc[0]
             bbox = (row["xmin"], row["xmax"], row["ymin"], row["ymax"])
-            true_class = int(row["class_id"])
-            
+            true_class = int(row["class_id"]) - 1
+
         frame = Frame(motion_vectors[index], frame_types[index], residuals[index], bbox, true_class, has_object)
         frames.append(frame)
     return Clip(frames)

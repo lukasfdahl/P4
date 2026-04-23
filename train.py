@@ -19,7 +19,7 @@ from helpers import (
     xyxy_to_xywh,
     load_clips_from_npz_dir,
 )
-from eval_framwork import BoundingBox, Prediction, evaluate
+from eval_framwork import BoundingBox, Prediction, evaluate, ModelMetric
 from npz_importer   import import_clip
 
 import mlflow
@@ -238,116 +238,113 @@ def train_one_epoch(
     return {k: v / max(n_batches, 1) for k, v in totals.items()}
 
 
-# validation step, no grad, eval framework for metrics
+import logging
+
+# Suppress MLflow/urllib3 noise
+logging.getLogger("mlflow").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+
 @torch.no_grad()
 def validate(
-    model:     ObjectDetector,
-    loader:    torch.utils.data.DataLoader,
-    cfg_loss:  dict,
-    device:    torch.device,
+    model: ObjectDetector,
+    loader: torch.utils.data.DataLoader,
+    cfg_loss: dict,
+    device: torch.device,
     num_classes: int,
-) -> tuple[dict, "ModelMetric"]:  # type: ignore[name-defined]
-   
-    """
-    Run validation: compute loss and detection metrics via eval_framework.py
-    """
-
-
-    # model evaluation
+    epoch: int,
+    save_dir: str = "visuals"
+) -> tuple[dict, ModelMetric]:
     model.eval()
-    totals   = {"loss_total": 0.0, "loss_cls": 0.0, "loss_l1": 0.0, "loss_giou": 0.0}
+    totals = {"loss_total": 0.0, "loss_cls": 0.0, "loss_l1": 0.0, "loss_giou": 0.0}
     n_batches = 0
+    
+    all_frame_preds = []
+    all_frame_gts = []
+    sample_images = [] # To store images for visualization
 
-    # results storage / reset
-    all_predictions:  list = []
-    all_ground_truth: list = []
-    latency_total = 0.0
-    n_frames      = 0
-
-
-    # batch loop
-    for batch in loader:
-
-        # device check
-        gt_boxes    = batch["boxes"].to(device)
-        gt_classes  = batch["true_class"].to(device)
-        mv          = batch.get("motion_vectors")
-        res         = batch.get("residuals")
-        frame_types = batch["frame_types"]
-
-        if mv  is not None: mv  = mv.to(device)
+    for i, batch in enumerate(loader):
+        gt_boxes = batch["boxes"].to(device)
+        gt_classes = batch["true_class"].to(device)
+        mv = batch.get("motion_vectors")
+        res = batch.get("residuals")
+        ft_sequence = batch["frame_types"][0]
+        
+        if mv is not None: mv = mv.to(device)
         if res is not None: res = res.to(device)
 
-        # same as train
-        # frame_types for the model: it expects a flat list of length T (one per frame).
-        # All clips in a batch share the same frame-type sequence (same clip_length),
-        # so we take the first clip's types.
-        ft_sequence = frame_types[0]
-        T = gt_boxes.shape[1]
-
-        # forward + latency measurement
-        t0 = time.perf_counter()
-
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            pred_boxes, pred_classes = model(mv, res, ft_sequence)
-            loss, parts = compute_loss(pred_boxes, pred_classes, gt_boxes, gt_classes, cfg_loss)
+            pred_boxes, pred_logits = model(mv, res, ft_sequence)
+            loss, parts = compute_loss(pred_boxes, pred_logits, gt_boxes, gt_classes, cfg_loss)
 
-        latency_total += time.perf_counter() - t0
-        n_frames      += gt_boxes.shape[0] * T
-
-        # Loss
+        # Accumulate losses
         for k, v in parts.items():
             totals[k] += v
         n_batches += 1
 
-        # Build eval_framework inputs
-        # pred_boxes:   [B, Q, 4]   (sigmoid, [xmin, xmax, ymin, ymax])
-        # pred_classes: [B, Q, C]   (logits)
+        # Prepare data for eval_framework.evaluate
         B, Q, _ = pred_boxes.shape
-        probs = torch.softmax(pred_classes, dim=-1)   # [B, Q, C]
-
-        # Collect predictions
+        probs = torch.softmax(pred_logits, dim=-1)
+        
         for b in range(B):
-            # Find the first valid GT frame in this clip (clip has one pred set, not per-frame)
-            valid_t = None
+            frame_preds = []
+            frame_gts = []
+            
+            # 1. Collect Predictions for this clip
+            for q in range(Q):
+                conf, cls_id = torch.max(probs[b, q], dim=-1)
+                if conf > 0.1: # Confidence threshold for metrics
+                    p = Prediction(
+                        xmin=pred_boxes[b, q, 0].item(),
+                        xmax=pred_boxes[b, q, 1].item(),
+                        ymin=pred_boxes[b, q, 2].item(),
+                        ymax=pred_boxes[b, q, 3].item(),
+                        class_id=cls_id.item(),
+                        confidence=conf.item()
+                    )
+                    frame_preds.append(p)
+            
+            # 2. Collect GTs for this clip (assuming one valid frame per clip for this test)
+            T = gt_boxes.shape[1]
             for t in range(T):
-                if gt_classes[b, t].item() != -1:
-                    valid_t = t
-                    break
+                if gt_classes[b, t] != -1:
+                    gt = BoundingBox(
+                        xmin=gt_boxes[b, t, 0].item(),
+                        xmax=gt_boxes[b, t, 1].item(),
+                        ymin=gt_boxes[b, t, 2].item(),
+                        ymax=gt_boxes[b, t, 3].item(),
+                        class_id=int(gt_classes[b, t].item())
+                    )
+                    frame_gts.append(gt)
+            
+            all_frame_preds.append(frame_preds)
+            all_frame_gts.append(frame_gts)
+            
+            # Store first batch images for visualization
+            if i == 0 and b < 4 and res is not None:
+                # Convert tensor back to image (C, H, W) -> (H, W, C)
+                img = res[b, 0].cpu().permute(1, 2, 0).numpy()
+                sample_images.append(img)
 
-            # Skip clips with no annotated frames at all
-            if valid_t is None:
-                continue
+    # Average losses
+    avg_losses = {k: v / n_batches for k, v in totals.items()}
+    
+    # Run eval framework
+    metrics = evaluate(all_frame_preds, all_frame_gts, latency=0.0)
 
-            box = gt_boxes[b, valid_t].cpu()
-            cls = gt_classes[b, valid_t].item()
+    # Visualise and save to MLflow
+    if sample_images:
+        os.makedirs(save_dir, exist_ok=True)
+        vis_path = os.path.join(save_dir, f"epoch_{epoch:03d}.png")
+        from eval_framwork import visualize_predictions
+        visualize_predictions(
+            all_frame_preds[:4], 
+            all_frame_gts[:4], 
+            frame_images=sample_images, 
+            save_path=vis_path
+        )
+        mlflow.log_artifact(vis_path, artifact_path="visuals")
 
-            gt_frame = [BoundingBox(
-                xmin=box[0].item(), xmax=box[1].item(),
-                ymin=box[2].item(), ymax=box[3].item(),
-                class_id=int(cls),
-            )]
-
-            # Pick the single highest-confidence query across all queries for this clip
-            conf_for_frame, best_cls_per_query = probs[b].max(dim=-1)  # [Q], [Q]
-            best_q = conf_for_frame.argmax().item()
-
-            pb = pred_boxes[b, best_q].cpu()
-            pred_frame = [Prediction(
-                xmin=pb[0].item(), xmax=pb[1].item(),
-                ymin=pb[2].item(), ymax=pb[3].item(),
-                class_id=int(best_cls_per_query[best_q].item()),
-                confidence=conf_for_frame[best_q].item(),
-            )]
-
-            all_predictions.append(pred_frame)
-            all_ground_truth.append(gt_frame)
-
-    avg_latency = latency_total / max(n_frames, 1)
-    metrics     = evaluate(all_predictions, all_ground_truth, latency=avg_latency)
-
-    return {k: v / max(n_batches, 1) for k, v in totals.items()}, metrics
-
+    return avg_losses, metrics
 
 # Main entry point
 def main(config_path: str, resume: str | None = None) -> None:

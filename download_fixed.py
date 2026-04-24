@@ -379,7 +379,7 @@ def run_download(df: pd.DataFrame) -> None:
                     chunks = segments[vid_id]
                     futures[executor.submit(
                         _worker_download_and_extract, vid_id, chunks, 
-                        tmp_dir, CONFIG["OUTPUT_DIR"], CONFIG["FRAME_H"], CONFIG["FRAME_W"], df
+                        tmp_dir, CONFIG["DATASET_DIR"], CONFIG["FRAME_H"], CONFIG["FRAME_W"], df
                     )] = vid_id
 
                 for future in as_completed(futures):

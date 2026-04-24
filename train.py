@@ -124,15 +124,17 @@ def compute_loss(
         # L1 Bounding Box Cost: pairwise distance
         cost_l1 = torch.cdist(pred_boxes[b], valid_gt_boxes, p=1)
         
-        # GIoU Cost: pairwise loop
-        cost_giou = torch.zeros((num_queries, num_gt), device=pred_boxes.device)
-        for i in range(num_queries):
-            for j in range(num_gt):
-                # giou_loss expects matching shapes, so we unsqueeze to add dummy batch dim
-                cost_giou[i, j] = giou_loss(
-                    pred_boxes[b, i].unsqueeze(0), 
-                    valid_gt_boxes[j].unsqueeze(0)
-                ).squeeze()
+        # GIoU Cost: pairwise loop, rm loop version
+
+        # GIoU Cost: Fully vectorized using broadcasting
+        # pred_boxes[b] shape: [num_queries, 4] -> unsqueeze(1) -> [num_queries, 1, 4]
+        # valid_gt_boxes shape: [num_gt, 4]     -> unsqueeze(0) -> [1, num_gt, 4]
+        # giou_loss broadcasts these together to calculate the [num_queries, num_gt] matrix instantly.
+
+        cost_giou = giou_loss(
+            pred_boxes[b].unsqueeze(1),
+            valid_gt_boxes.unsqueeze(0)
+        )
                 
         # 3. Combine into final Cost Matrix and move to CPU for SciPy
         C = (w_cls * cost_class) + (w_l1 * cost_l1) + (w_giou * cost_giou)

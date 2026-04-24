@@ -9,6 +9,11 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+checkpoints/
+import/
+mlruns/
+model_graph.png
+
 # C extensions
 *.so
 

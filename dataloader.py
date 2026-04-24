@@ -442,7 +442,7 @@ if __name__ == "__main__":
     print(f"[DataLoader] Streams active: motion_vectors={USE_MOTIONVECTORS}  residuals={USE_RESIDUALS}")
 
     # Set limit_1_video=True so we only grab 1 video and trigger the split fix
-    train_loader, val_loader, test_loader = build_data_loaders(npz_dir="downloaded_videos/", limit_1_video=True)
+    train_loader, val_loader, test_loader = build_data_loaders(npz_dir="dataset/", limit_1_video=True)
 
     # Handle potentially empty val/test loaders cleanly in prints
     val_size = len(val_loader.dataset) if hasattr(val_loader, 'dataset') else 0

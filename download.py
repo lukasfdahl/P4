@@ -367,7 +367,7 @@ def _extract_motion_vectors_ffmpeg(video_path: str, n_frames: int, h_mv: int, w_
 
 
 # Parallel Download Pipeline
-def _worker_download_and_extract(vid_id, chunks, tmp_dir, output_dir, frame_h, frame_w):
+def _worker_download_and_extract(vid_id, chunks, tmp_dir, output_dir, frame_h, frame_w, df):
     out_npz = os.path.join(output_dir, f"{vid_id}.npz")
     
     if os.path.exists(out_npz):
@@ -377,7 +377,18 @@ def _worker_download_and_extract(vid_id, chunks, tmp_dir, output_dir, frame_h, f
     if not mp4_path:
         return vid_id, f"failed_download ({error_msg})"
 
-    success = _extract_to_npz(mp4_path, out_npz, frame_h, frame_w)
+    # We need the start time of the cut to calculate the global timestamp.
+    # yt-dlp chunks are usually formatted as a list of tuples: [(start_time, end_time)]
+    try:
+        if isinstance(chunks[0], (list, tuple)):
+            chunk_start_time = float(chunks[0][0])
+        else:
+            chunk_start_time = float(chunks[0])
+    except (IndexError, TypeError):
+        chunk_start_time = 0.0  # Fallback just in case
+
+    # -- THE FIX: Pass the 3 missing arguments (df, vid_id, chunk_start_time) --
+    success = _extract_to_npz(mp4_path, out_npz, frame_h, frame_w, df, vid_id, chunk_start_time)
     
     try:
         os.remove(mp4_path)
@@ -430,7 +441,7 @@ def run_download(df: pd.DataFrame) -> None:
                     chunks = segments[vid_id]
                     futures[executor.submit(
                         _worker_download_and_extract, vid_id, chunks, 
-                        tmp_dir, CONFIG["OUTPUT_DIR"], CONFIG["FRAME_H"], CONFIG["FRAME_W"]
+                        tmp_dir, CONFIG["OUTPUT_DIR"], CONFIG["FRAME_H"], CONFIG["FRAME_W"], df
                     )] = vid_id
 
                 for future in as_completed(futures):

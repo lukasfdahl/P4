@@ -60,31 +60,36 @@ def import_clip(clip_path : str) -> Clip:
     data = np.load(clip_path)
     raw_motion_vectors : np.ndarray = data["motion_vectors"]
     frame_types : NDArray[np.str_] = data["frame_types"]
-    residuals : np.ndarray = data["residuals"] # i am pretty sure it uses YUV color format from looking though the code for the cv_reader
+    residuals : np.ndarray = data["residuals"]
     motion_vectors = raw_motion_vectors.view(MV_STRUCT)
     
-    # labels
-    video_id = os.path.basename(clip_path).replace(".npz", "") # since the files have the video id in the name we just get the name and strip out the .npz to get the id
-    video_labels = labels[labels["youtube_id"] == video_id]
+    # load labels directly from the baked-in arrays
+    boxes = data['boxes']
+    true_classes = data['true_class']
     
-    # createing the frame and clip objects
+    # creating the frame and clip objects
     frames = []
-    for index in range(len(frame_types)): # loop though each frame
-        rounded_ms = (index // fps) * 1000 # get the millisecond time of the current frame at 30fps rounded down to nearest 1000ms
-        frame_labels = video_labels[video_labels["timestamp_ms"] == rounded_ms]
-        bbox = (-1, -1, -1, -1) # defualt value in case no bounding box/class is found (same goes for variables bellow)
-        true_class = -1
-        has_object = False
+    for index in range(len(frame_types)):
         
-        if not frame_labels.empty: # if labels where found at the nearest timestamp to the current frame (then use the first listed label)
-            # grabs the first label (in case there are multiple)
-            has_object = True
-            row = frame_labels.iloc[0]
-            bbox = (row["xmin"], row["xmax"], row["ymin"], row["ymax"])
-            true_class = int(row["class_id"]) - 1
-
-        frame = Frame(motion_vectors[index], frame_types[index], residuals[index], bbox, true_class, has_object)
+        # Read directly from our new arrays
+        true_class = int(true_classes[index])
+        has_object = (true_class != -1)
+        
+        if has_object:
+            bbox = tuple(boxes[index])  # Use the actual box
+        else:
+            bbox = (-1.0, -1.0, -1.0, -1.0) # Default background box
+            
+        frame = Frame(
+            motion_vectors=motion_vectors[index], 
+            frame_type=frame_types[index], 
+            residuals=residuals[index], 
+            true_bounding_box=bbox, 
+            true_class=true_class, 
+            has_object=has_object
+        )
         frames.append(frame)
+        
     return Clip(frames)
 
 

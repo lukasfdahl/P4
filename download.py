@@ -246,7 +246,7 @@ MV_STRUCT = np.dtype([
     ("motion_scale", np.int32),
 ])
 
-def _extract_to_npz(video_path: str, output_npz: str, frame_h: int, frame_w: int) -> bool:
+def _extract_to_npz(video_path: str, output_npz: str, frame_h: int, frame_w: int, df, vid_id: str, chunk_start_time: float) -> bool:
     try:
         import cv2 #debug error fix?
     except ImportError:
@@ -299,12 +299,35 @@ def _extract_to_npz(video_path: str, output_npz: str, frame_h: int, frame_w: int
     except Exception:
         pass # fallback to zeros
 
+    matched_boxes_array = np.zeros((min_frames, 4), dtype=np.float32)
+    matched_class_array = np.full((min_frames,), -1, dtype=np.int32)
+
+    video_df = df[df["youtube_id"] == vid_id]
+
+    for i in range(min_frames):
+        # Recreate the original YouTube global timestamp for this specific frame
+        frame_global_time_ms = (chunk_start_time + (i / 30.0)) * 1000.0
+        
+        # Find matching annotations within a 17ms window
+        matches = video_df[
+            (video_df["timestamp_ms"] >= frame_global_time_ms - 17) & 
+            (video_df["timestamp_ms"] <= frame_global_time_ms + 17)
+        ]
+        
+        if not matches.empty:
+            row = matches.iloc[0]
+            matched_boxes_array[i] = [row["xmin"], row["xmax"], row["ymin"], row["ymax"]]
+            # Assuming classes in CSV are 1-indexed, we shift them to 0-indexed for PyTorch
+            matched_class_array[i] = int(row["class_id"]) - 1
+
     # 4. Save
     np.savez_compressed(
         output_npz,
         frame_types    = frame_types,
         motion_vectors = mv_array.view(np.int32).reshape(min_frames, n_mv, 4),
         residuals      = residuals,
+        boxes          = matched_boxes_array,
+        true_class     = matched_class_array,
     )
     return True
 

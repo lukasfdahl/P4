@@ -6,10 +6,12 @@ nvidia-ml-py
 # Data Downloading & Processing 
 yt-dlp
 pandas
-opencv-python-headless==4.10.0
+opencv-python-headless>=4.10.0
 
 # Configuration & Architecture
 pyyaml
 torchinfo
 torchview
 graphviz
+
+tqdm

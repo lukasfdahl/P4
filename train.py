@@ -284,24 +284,45 @@ def validate(
         # Prepare data for eval_framework.evaluate
         B, Q, _ = pred_boxes.shape
         probs = torch.softmax(pred_logits, dim=-1)
-        
+
+        # Sort box coords so xmin<=xmax and ymin<=ymax.
+        # The bbox MLP+sigmoid gives values in [0,1] but with no ordering guarantee.
+        # If xmin > xmax, _compute_iou() gets a negative intersection width → IoU=0
+        # for every prediction regardless of how well the model has learned.
+        boxes_eval = torch.stack([
+            torch.minimum(pred_boxes[..., 0], pred_boxes[..., 1]),  # xmin
+            torch.maximum(pred_boxes[..., 0], pred_boxes[..., 1]),  # xmax
+            torch.minimum(pred_boxes[..., 2], pred_boxes[..., 3]),  # ymin
+            torch.maximum(pred_boxes[..., 2], pred_boxes[..., 3]),  # ymax
+        ], dim=-1)  # [B, Q, 4]
+
         for b in range(B):
             frame_preds = []
             frame_gts = []
-            
+
+            # Use a confidence threshold of 0.3 instead of 0.1 / top-K.
+            # With num_classes=23, a random query spreads softmax across all classes
+            # giving ~0.04 per class by chance, so the max sits around 0.08-0.15.
+            # A genuine detection should comfortably clear 0.3 regardless of how many
+            # classes are active in the current dataset. This also avoids flooding the
+            # eval framework with hundreds of noise predictions that tank precision.
+            confs, cls_ids = torch.max(probs[b], dim=-1)  # [Q], [Q]
+
             # 1. Collect Predictions for this clip
             for q in range(Q):
-                conf, cls_id = torch.max(probs[b, q], dim=-1)
-                if conf > 0.1: # Confidence threshold for metrics
-                    p = Prediction(
-                        xmin=pred_boxes[b, q, 0].item(),
-                        xmax=pred_boxes[b, q, 1].item(),
-                        ymin=pred_boxes[b, q, 2].item(),
-                        ymax=pred_boxes[b, q, 3].item(),
-                        class_id=cls_id.item(),
-                        confidence=conf.item()
-                    )
-                    frame_preds.append(p)
+                conf   = confs[q].item()
+                cls_id = cls_ids[q].item()
+                if conf < 0.3:
+                    continue
+                p = Prediction(
+                    xmin=boxes_eval[b, q, 0].item(),
+                    xmax=boxes_eval[b, q, 1].item(),
+                    ymin=boxes_eval[b, q, 2].item(),
+                    ymax=boxes_eval[b, q, 3].item(),
+                    class_id=cls_id,
+                    confidence=conf,
+                )
+                frame_preds.append(p)
             
             # 2. Collect GTs for this clip (assuming one valid frame per clip for this test)
             T = gt_boxes.shape[1]
@@ -380,20 +401,17 @@ def main(config_path: str, resume: str | None = None) -> None:
     mlflow.set_tracking_uri("http://localhost:8080") 
     mlflow.set_experiment(exp_name)
 
-    # Start the MLflow run
-    with mlflow.start_run(run_name="training_run_01"):
-        
-        # Log your entire config as a dictionary so you know exactly what parameters were used
-        mlflow.log_dict(cfg, "config.yaml")
-        
-        # You can also log specific high-level params for easier sorting in the UI
-        mlflow.log_params({
-            "lr": cfg_train["lr"],
-            "epochs": cfg_train["epochs"],
-            "clip_length": cfg_data["clip_length"],
-            "batch_size": cfg_train.get("batch_size", "unknown")
-        })
-    
+    # The previous `with` block closed right after log_params(), before the model
+    # was built, so all log_metrics() calls in the epoch loop were outside the run.
+    mlflow.start_run(run_name="training_run_01")
+    mlflow.log_dict(cfg, "config.yaml")
+    mlflow.log_params({
+        "lr": cfg_train["lr"],
+        "epochs": cfg_train["epochs"],
+        "clip_length": cfg_data["clip_length"],
+        "batch_size": cfg_train.get("batch_size", "unknown")
+    })
+
     # mixed prec:
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
@@ -588,6 +606,7 @@ def main(config_path: str, resume: str | None = None) -> None:
             mlflow.log_artifact(best_path, artifact_path="models")
 
     print(f"\n[train] Done. Best val_loss: {best_val_loss:.4f}")
+    mlflow.end_run()
 
 
 # main loop where all is actiaveted

@@ -350,6 +350,12 @@ def validate(
     avg_losses = {k: v / n_batches for k, v in totals.items()}
     
     # Run eval framework
+
+    # Temporary debug
+    n_preds = sum(len(p) for p in all_frame_preds)
+    n_gts   = sum(len(g) for g in all_frame_gts)
+    print(f"[debug] val clips={len(all_frame_preds)}  total_preds={n_preds}  total_gts={n_gts}")
+
     metrics = evaluate(all_frame_preds, all_frame_gts, latency=0.0)
 
     # Visualise and save to MLflow
@@ -369,6 +375,11 @@ def validate(
 
 # Main entry point
 def main(config_path: str, resume: str | None = None) -> None:
+
+    # Restrict monitoring to only the GPU SLURM gave us
+    gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+    os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "true"
 
     # This tells MLflow to automatically log CPU, RAM, and GPU usage
     os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "true"
@@ -398,7 +409,7 @@ def main(config_path: str, resume: str | None = None) -> None:
     
     # Optional: Set tracking URI if your MLflow server is running on a specific host/port
     # If running locally in the same folder, it defaults to a local ./mlruns directory
-    mlflow.set_tracking_uri("http://localhost:8080") 
+    mlflow.set_tracking_uri("http://localhost:8501") 
     mlflow.set_experiment(exp_name)
 
     # The previous `with` block closed right after log_params(), before the model

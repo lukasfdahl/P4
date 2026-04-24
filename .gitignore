@@ -13,6 +13,7 @@ mlruns/
 
 /import
 
+RecidualExtraction/
 # C extensions
 *.so
 

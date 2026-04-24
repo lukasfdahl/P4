@@ -24,6 +24,7 @@ from npz_importer   import import_clip
 
 import mlflow
 import os
+from tqdm import tqdm
 
 
 #list of things for train.py
@@ -192,7 +193,8 @@ def train_one_epoch(
     n_batches = 0
 
     # batch loop
-    for batch in loader:
+    pbar = tqdm(loader, desc="  train", leave=False, unit="batch")
+    for batch in pbar:
         
         # move to device
         gt_boxes   = batch["boxes"].to(device)       # [B, T, 4]
@@ -234,6 +236,7 @@ def train_one_epoch(
         for k, v in parts.items():
             totals[k] += v
         n_batches += 1
+        pbar.set_postfix(loss=f"{parts['loss_total']:.4f}")
 
     return {k: v / max(n_batches, 1) for k, v in totals.items()}
 
@@ -243,6 +246,8 @@ import logging
 # Suppress MLflow/urllib3 noise
 logging.getLogger("mlflow").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
+logging.getLogger("uvicorn").setLevel(logging.ERROR)
+logging.getLogger("uvicorn.access").setLevel(logging.ERROR)
 
 @torch.no_grad()
 def validate(
@@ -262,7 +267,7 @@ def validate(
     all_frame_gts = []
     sample_images = [] # To store images for visualization
 
-    for i, batch in enumerate(loader):
+    for i, batch in enumerate(tqdm(loader, desc="  val  ", leave=False, unit="batch")):
         gt_boxes = batch["boxes"].to(device)
         gt_classes = batch["true_class"].to(device)
         mv = batch.get("motion_vectors")
@@ -349,13 +354,6 @@ def validate(
     # Average losses
     avg_losses = {k: v / n_batches for k, v in totals.items()}
     
-    # Run eval framework
-
-    # Temporary debug
-    n_preds = sum(len(p) for p in all_frame_preds)
-    n_gts   = sum(len(g) for g in all_frame_gts)
-    print(f"[debug] val clips={len(all_frame_preds)}  total_preds={n_preds}  total_gts={n_gts}")
-
     metrics = evaluate(all_frame_preds, all_frame_gts, latency=0.0)
 
     # Visualise and save to MLflow
@@ -376,12 +374,8 @@ def validate(
 # Main entry point
 def main(config_path: str, resume: str | None = None) -> None:
 
-    # Restrict monitoring to only the GPU SLURM gave us
     gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-    os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "true"
-
-    # This tells MLflow to automatically log CPU, RAM, and GPU usage
     os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "true"
 
     # Load config
@@ -422,6 +416,10 @@ def main(config_path: str, resume: str | None = None) -> None:
         "clip_length": cfg_data["clip_length"],
         "batch_size": cfg_train.get("batch_size", "unknown")
     })
+    # Log the full config as a tag so it's readable in the MLflow run overview
+    # without having to download the artifact
+    mlflow.set_tag("config", yaml.dump(cfg, default_flow_style=False))
+    mlflow.set_tag("gpu_id", gpu_id)
 
     # mixed prec:
 
@@ -457,14 +455,18 @@ def main(config_path: str, resume: str | None = None) -> None:
     snap        = cfg_data.get("snap_to_iframe", True)
 
     # set up data loaders
+    # pin_memory=True pages tensors into pinned (non-pageable) RAM so the
+    # CUDA DMA engine can transfer them to the GPU without a CPU copy,
+    # which significantly reduces the time the GPU sits idle waiting for data.
     train_loader, val_loader, test_loader = build_data_loaders(
             npz_dir=cfg["data"]["npz_dir"],
             clip_length=cfg["data"]["clip_length"],
-            stride=cfg["data"]["stride"],   
+            stride=cfg["data"]["stride"],
             snap_to_iframe=cfg["data"]["snap_to_iframe"],
             max_files=cfg["data"].get("max_files"),
             batch_size=cfg_train["batch_size"],
-            num_workers=cfg_train.get("num_workers", 0),
+            num_workers=cfg_train.get("num_workers", 4),
+            pin_memory=(device.type == "cuda"),
         )
 
     # debug

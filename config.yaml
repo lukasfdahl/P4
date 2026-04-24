@@ -24,7 +24,7 @@ model:
 
 # Data pipeline
 data:
-  npz_dir:          "downloaded_videos/"   # directory of .npz files from extractor.py
+  npz_dir:          "dataset/"   # directory of .npz files from extractor.py
   frame_h:          64
   frame_w:          64
   clip_length:      5          # must match model.clip_length

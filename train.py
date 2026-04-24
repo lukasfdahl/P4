@@ -498,7 +498,7 @@ def main(config_path: str, resume: str | None = None) -> None:
         )
 
         if val_loader:
-            val_losses, val_metrics = validate(model, val_loader, cfg_loss, device, cfg_model["num_classes"])
+            val_losses, val_metrics = validate(model, val_loader, cfg_loss, device, cfg_model["num_classes"], epoch)
         else:
             print("  [train] No validation data, skipping validate()")
             # use dummy values so the rest of the loop doesn't crash

@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ------------------- VARIABLES -------------------
 
 Dataset_file = "yt_bb_detection_train.csv"
-Samples_size = 20
+Samples_size = 50
 Selected_Classes = 5
 
 Output_dir = "downloaded_clips"

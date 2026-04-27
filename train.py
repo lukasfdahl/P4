@@ -374,7 +374,7 @@ def validate(
     return avg_losses, metrics
 
 # Main entry point
-def main(config_path: str, resume: str | None = None) -> None:
+def main(config_path: str, resume: str | None = None, npz_dir_override: str | None = None) -> None:
 
     gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
@@ -384,6 +384,11 @@ def main(config_path: str, resume: str | None = None) -> None:
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
         print(f"[train] Loaded config from {config_path}")
+
+    # Override npz_dir if passed from slurm (local scratch is much faster than /ceph)
+    if npz_dir_override is not None:
+        cfg["data"]["npz_dir"] = npz_dir_override
+        print(f"[train] npz_dir overridden to: {npz_dir_override}")
 
     cfg_model  = cfg["model"]
     cfg_data   = cfg["data"]
@@ -410,7 +415,7 @@ def main(config_path: str, resume: str | None = None) -> None:
 
     # The previous `with` block closed right after log_params(), before the model
     # was built, so all log_metrics() calls in the epoch loop were outside the run.
-    mlflow.start_run(run_name="training_run_01")
+    mlflow.start_run(run_name=cfg.get("run_name", "training_run"))
     mlflow.log_dict(cfg, "config.yaml")
     mlflow.log_params({
         "lr": cfg_train["lr"],
@@ -627,9 +632,20 @@ def main(config_path: str, resume: str | None = None) -> None:
 # main loop where all is actiaveted
 #could be paired with checks firstly
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config",   default="config.yaml")
+    parser.add_argument("--npz-dir",  default=None,
+                        help="Override data.npz_dir from config (e.g. local scratch path)")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        _cfg = yaml.safe_load(f)
+
     main(
-        config_path = "config.yaml",
-        resume      = None,
+        config_path = args.config,
+        resume      = _cfg.get("resume", None),
+        npz_dir_override = args.npz_dir,
     )
 
 

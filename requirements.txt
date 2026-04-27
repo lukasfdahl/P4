@@ -13,5 +13,5 @@ pyyaml
 torchinfo
 torchview
 graphviz
-
+pynvml
 tqdm

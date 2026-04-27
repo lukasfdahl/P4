@@ -4,7 +4,14 @@
 # train.py loads this file and logs its full contents to the run directory
 # so every checkpoint is reproducible.
 
-experiment_name: "test123"
+experiment_name: "test_100_videos"
+run_name:        "run01_100videos_3class"
+
+
+# Resume training from a checkpoint.
+# Set to the path of last.pt to continue after a time-limit, or null to start fresh.
+# Example: resume: "checkpoints/test123/last.pt"
+resume: null
 
 # Model architecture
 # All values here are forwarded directly to ObjectDetector.__init__()
@@ -28,23 +35,23 @@ data:
   frame_h:          64
   frame_w:          64
   clip_length:      5          # must match model.clip_length
-  stride:           2          # sliding-window stride (frames).
+  stride:           4          # sliding-window stride (frames).
                                # stride=clip_length → no overlap (fastest)
                                # stride=1           → maximum overlap (slowest, most clips)
   snap_to_iframe:   true       # start each window on an I-frame when possible
   use_motionvectors: true
   use_residuals:    true
-  train_ratio:      0.8
-  val_ratio:        0.1
-  test_ratio:       0.1
-  max_files:        10
+  train_ratio:      0.7
+  val_ratio:        0.3
+  test_ratio:       0.0
+  max_files:        100
 
 # Training loop
 training:
   epochs:        50
-  batch_size:    8
+  batch_size:    16
   seed:          42
-  num_workers:   4
+  num_workers:   12
   lr:            1.0e-4
   weight_decay:  0
   grad_clip:     1.0           # max gradient norm — important for transformer stability

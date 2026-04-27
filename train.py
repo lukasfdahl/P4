@@ -25,6 +25,7 @@ from npz_importer   import import_clip
 import mlflow
 import os
 from tqdm import tqdm
+import pynvml
 
 
 #list of things for train.py
@@ -266,8 +267,21 @@ def validate(
     n_batches = 0
     
     all_frame_preds = []
-    all_frame_gts = []
-    sample_images = [] # To store images for visualization
+    all_frame_gts   = []
+    sample_images   = []  # one image per clip (frame 0), for the overview plot
+
+    # Temporal analysis: store full clip data from the first batch so we can
+    # visualise how predictions evolve across the T frames of a single clip.
+    # Each entry covers one clip and contains:
+    #   "images"   : List[np.ndarray]       – all T residual frames (H,W,C)
+    #   "gt_per_t" : List[List[BoundingBox]] – GT boxes at each time-step t
+    #   "boxes"    : np.ndarray [Q, 4]      – clip-level predicted boxes
+    #   "cls_ids"  : np.ndarray [Q]         – argmax class per query
+    #   "confs"    : np.ndarray [Q]         – max softmax confidence per query
+    # The model outputs one set of Q queries for the whole clip (not per frame),
+    # so hopping is visible by comparing the best-matching query across each
+    # frame's GT annotations over time.
+    temporal_clips: list = []  # filled from batch 0 only
 
     for i, batch in enumerate(tqdm(loader, desc="  val  ", leave=False, unit="batch")):
         gt_boxes = batch["boxes"].to(device)
@@ -307,20 +321,28 @@ def validate(
             frame_preds = []
             frame_gts = []
 
-            # Use a confidence threshold of 0.3 instead of 0.1 / top-K.
-            # With num_classes=23, a random query spreads softmax across all classes
-            # giving ~0.04 per class by chance, so the max sits around 0.08-0.15.
-            # A genuine detection should comfortably clear 0.3 regardless of how many
-            # classes are active in the current dataset. This also avoids flooding the
-            # eval framework with hundreds of noise predictions that tank precision.
+            # Confidence threshold + top-K cap.
+            # With num_classes=23, random softmax peaks sit around 0.04–0.15,
+            # so 0.5 comfortably separates noise from genuine detections.
+            # The top-K cap (default 10) prevents a flood of near-threshold
+            # queries from drowning out the true positives in both the metrics
+            # and the visualisation — without any spatial suppression (no NMS).
+            CONF_THRESHOLD  = 0.5
+            MAX_PREDS_CLIP  = 10
+
             confs, cls_ids = torch.max(probs[b], dim=-1)  # [Q], [Q]
 
-            # 1. Collect Predictions for this clip
+            # 1. Collect all queries that clear the confidence threshold
+            candidates = []
             for q in range(Q):
                 conf   = confs[q].item()
                 cls_id = cls_ids[q].item()
-                if conf < 0.3:
-                    continue
+                if conf >= CONF_THRESHOLD:
+                    candidates.append((conf, q, cls_id))
+
+            # 2. Keep only the top-K by confidence
+            candidates.sort(reverse=True)
+            for conf, q, cls_id in candidates[:MAX_PREDS_CLIP]:
                 p = Prediction(
                     xmin=boxes_eval[b, q, 0].item(),
                     xmax=boxes_eval[b, q, 1].item(),
@@ -331,45 +353,114 @@ def validate(
                 )
                 frame_preds.append(p)
             
-            # 2. Collect GTs for this clip (assuming one valid frame per clip for this test)
+            # 2. Collect GTs for this clip.
+            # Each clip has T time-steps but typically only one labelled anchor
+            # frame (the rest are padding with class == -1).  Collapsing all T
+            # frames into one flat list caused duplicates and made most clips
+            # appear to have no GT (all -1 padding).
+            # Fix: keep every distinct valid annotation, deduplicated by
+            # (class_id, rounded coords) so a label repeated across frames
+            # is only counted once.
             T = gt_boxes.shape[1]
+            seen_gts: set = set()
             for t in range(T):
-                if gt_classes[b, t] != -1:
-                    gt = BoundingBox(
-                        xmin=gt_boxes[b, t, 0].item(),
-                        xmax=gt_boxes[b, t, 1].item(),
-                        ymin=gt_boxes[b, t, 2].item(),
-                        ymax=gt_boxes[b, t, 3].item(),
-                        class_id=int(gt_classes[b, t].item())
-                    )
-                    frame_gts.append(gt)
+                if gt_classes[b, t] == -1:
+                    continue
+                cls_t  = int(gt_classes[b, t].item())
+                coords = (
+                    round(gt_boxes[b, t, 0].item(), 4),
+                    round(gt_boxes[b, t, 1].item(), 4),
+                    round(gt_boxes[b, t, 2].item(), 4),
+                    round(gt_boxes[b, t, 3].item(), 4),
+                )
+                key = (cls_t, *coords)
+                if key in seen_gts:
+                    continue
+                seen_gts.add(key)
+                gt = BoundingBox(
+                    xmin=coords[0], xmax=coords[1],
+                    ymin=coords[2], ymax=coords[3],
+                    class_id=cls_t,
+                )
+                frame_gts.append(gt)
             
             all_frame_preds.append(frame_preds)
             all_frame_gts.append(frame_gts)
-            
-            # Store first batch images for visualization
+
+            # Overview plot: store frame-0 image for first 4 clips of batch 0
             if i == 0 and b < 4 and res is not None:
-                # Convert tensor back to image (C, H, W) -> (H, W, C)
                 img = res[b, 0].cpu().permute(1, 2, 0).numpy()
                 sample_images.append(img)
+
+            # Temporal plot: store ALL T frames + raw query outputs for batch 0
+            if i == 0 and res is not None:
+                T_frames = res.shape[1]  # number of time-steps in the clip
+
+                # All T residual frames for this clip
+                clip_images = [
+                    res[b, t].cpu().permute(1, 2, 0).numpy()
+                    for t in range(T_frames)
+                ]
+
+                # Per-time-step GT boxes (raw, not deduplicated — we want to
+                # see which frames actually have an annotation)
+                gt_per_t = []
+                for t in range(T_frames):
+                    t_gts = []
+                    if gt_classes[b, t] != -1:
+                        t_gts.append(BoundingBox(
+                            xmin=gt_boxes[b, t, 0].item(),
+                            xmax=gt_boxes[b, t, 1].item(),
+                            ymin=gt_boxes[b, t, 2].item(),
+                            ymax=gt_boxes[b, t, 3].item(),
+                            class_id=int(gt_classes[b, t].item()),
+                        ))
+                    gt_per_t.append(t_gts)
+
+                temporal_clips.append({
+                    "images":   clip_images,
+                    "gt_per_t": gt_per_t,
+                    "boxes":    boxes_eval[b].cpu().numpy(),   # [Q, 4]
+                    "cls_ids":  cls_ids.cpu().numpy(),          # [Q]
+                    "confs":    confs.cpu().numpy(),            # [Q]
+                })
 
     # Average losses
     avg_losses = {k: v / n_batches for k, v in totals.items()}
     
     metrics = evaluate(all_frame_preds, all_frame_gts, latency=0.0)
 
-    # Visualise and save to MLflow
+    # Overview plot — 4 clips side-by-side (existing)
     if sample_images:
         os.makedirs(save_dir, exist_ok=True)
         vis_path = os.path.join(save_dir, f"epoch_{epoch:03d}.png")
         from eval_framwork import visualize_predictions
         visualize_predictions(
-            all_frame_preds[:4], 
-            all_frame_gts[:4], 
-            frame_images=sample_images, 
-            save_path=vis_path
+            all_frame_preds[:4],
+            all_frame_gts[:4],
+            frame_images=sample_images,
+            save_path=vis_path,
+            max_preds_shown=MAX_PREDS_CLIP,
         )
         mlflow.log_artifact(vis_path, artifact_path="visuals")
+
+    # Temporal plot — one clip unrolled across its T frames
+    if temporal_clips:
+        from eval_framwork import visualize_temporal
+
+        # Each clip contains one object/class, so any scoring heuristic
+        # is meaningless — just pick a random clip from the batch.
+        import random as _random
+        chosen = _random.randrange(len(temporal_clips))
+
+        temp_path = os.path.join(save_dir, f"epoch_{epoch:03d}_temporal.png")
+        visualize_temporal(
+            clip=temporal_clips[chosen],
+            conf_threshold=CONF_THRESHOLD,
+            max_preds_shown=MAX_PREDS_CLIP,
+            save_path=temp_path,
+        )
+        mlflow.log_artifact(temp_path, artifact_path="visuals")
 
     return avg_losses, metrics
 
@@ -378,7 +469,12 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
 
     gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-    os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "true"
+    os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "false"
+
+    # debug to se gpu metrics different way
+    pynvml.nvmlInit()
+    physical_gpu_id = int(gpu_id.split(",")[0])
+    gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(physical_gpu_id)
 
     # Load config
     with open(config_path) as f:
@@ -578,6 +674,18 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
                 "val_IoU": val_metrics.iou
             })
 
+        # new method to try to get the gpu metrics
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
+        util_info = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
+        
+        metrics_to_log.update({
+            "my_gpu/memory_used_MB": mem_info.used // (1024 ** 2),
+            "my_gpu/memory_total_MB": mem_info.total // (1024 ** 2),
+            "my_gpu/utilization_percent": util_info.gpu
+        })
+
+        mlflow.log_metrics(metrics_to_log, step=epoch)
+
         mlflow.log_metrics(metrics_to_log, step=epoch)
         
         if val_loader:
@@ -627,6 +735,7 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
 
     print(f"\n[train] Done. Best val_loss: {best_val_loss:.4f}")
     mlflow.end_run()
+    pynvml.nvmlShutdown()
 
 
 # main loop where all is actiaveted

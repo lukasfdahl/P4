@@ -20,7 +20,8 @@ from helpers import (
     load_clips_from_npz_dir,
 )
 from eval_framwork import BoundingBox, Prediction, evaluate, ModelMetric
-from npz_importer   import import_clip
+# NOTE: npz_importer intentionally not imported — it runs download_dataset()
+# and import_dataset() at module level, loading the full 400MB CSV on startup.
 
 import mlflow
 import os
@@ -354,32 +355,19 @@ def validate(
                 frame_preds.append(p)
             
             # 2. Collect GTs for this clip.
-            # Each clip has T time-steps but typically only one labelled anchor
-            # frame (the rest are padding with class == -1).  Collapsing all T
-            # frames into one flat list caused duplicates and made most clips
-            # appear to have no GT (all -1 padding).
-            # Fix: keep every distinct valid annotation, deduplicated by
-            # (class_id, rounded coords) so a label repeated across frames
-            # is only counted once.
+            # We keep all valid annotations across the T frames without deduplicating
+            # them, so they properly display in the visuals.
             T = gt_boxes.shape[1]
-            seen_gts: set = set()
             for t in range(T):
                 if gt_classes[b, t] == -1:
                     continue
                 cls_t  = int(gt_classes[b, t].item())
-                coords = (
-                    round(gt_boxes[b, t, 0].item(), 4),
-                    round(gt_boxes[b, t, 1].item(), 4),
-                    round(gt_boxes[b, t, 2].item(), 4),
-                    round(gt_boxes[b, t, 3].item(), 4),
-                )
-                key = (cls_t, *coords)
-                if key in seen_gts:
-                    continue
-                seen_gts.add(key)
+                
                 gt = BoundingBox(
-                    xmin=coords[0], xmax=coords[1],
-                    ymin=coords[2], ymax=coords[3],
+                    xmin=gt_boxes[b, t, 0].item(), 
+                    xmax=gt_boxes[b, t, 1].item(),
+                    ymin=gt_boxes[b, t, 2].item(), 
+                    ymax=gt_boxes[b, t, 3].item(),
                     class_id=cls_t,
                 )
                 frame_gts.append(gt)
@@ -570,7 +558,7 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
             batch_size=cfg_train["batch_size"],
             num_workers=cfg_train.get("num_workers", 4),
             pin_memory=(device.type == "cuda"),
-            target_classes=cfg["data"].get("target_classes") or None,
+            target_classes=cfg["data"].get("target_classes", []),
         )
 
     # debug

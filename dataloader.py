@@ -33,7 +33,6 @@ from dataclasses import asdict
 
 from data_classes import Frame, Clip, MV_STRUCT
 from helpers import load_clips_from_npz_dir, build_window_index
-from npz_importer import import_clip # Added to dynamically load clips
 
 # config for experiments, to toggle input features
 USE_MOTIONVECTORS = True   # include motion-vector stream
@@ -76,7 +75,15 @@ def lazy_build_window_index(
     filter_empty:   bool = False,
     target_classes: list[int] | None = None,
 ) -> list[tuple[int, int]]:
-    
+    """
+    Builds sliding windows by reading only lightweight metadata from each NPZ.
+
+    target_classes : list[int] | None
+        Original YouTube-BB class IDs (1-based) to keep.
+        The downloader stores class_id - 1, so we convert here automatically.
+        Windows where every frame is padding (-1) or outside the target set
+        are dropped entirely.Pass None to keep all windows.
+    """
     # Convert original 1-based IDs → stored 0-based IDs for O(1) lookup
     target_set = (
         {c - 1 for c in target_classes} if target_classes is not None else None
@@ -204,10 +211,10 @@ class ClipDataset(Dataset):
         self.clip_length = clip_length
         self.base_mv_scale = base_mv_scale
         
-        # RAM FIX test Worker-level cache so we only load files when needed
         self.is_lazy = len(source_data) > 0 and isinstance(source_data[0], str)
-        self._current_path = None
-        self._current_clip = None
+        # LRU cache: keeps last 8 NPZ files open per worker (insertion-order dict)
+        self._npz_cache:  dict = {}
+        self._cache_size: int  = 8
  
     def __len__(self) -> int:
         return len(self.indices)
@@ -223,96 +230,108 @@ class ClipDataset(Dataset):
         sample_idx = self.indices[idx]
         clip_idx, start = self.window_index[sample_idx]
 
-        # LAZY LOAD LOGIC
         if self.is_lazy:
+            # Direct numpy slice from NPZ — no Frame/Clip construction.
+            # mmap_mode="r" means the OS only fetches the pages we slice,
+            # not the whole file. LRU cache keeps last 8 files open per worker.
             file_path = self.source_data[clip_idx]
-            if self._current_path != file_path:
-                self._current_clip = import_clip(file_path)
-                self._current_path = file_path
-            clip = self._current_clip
+            if file_path not in self._npz_cache:
+                if len(self._npz_cache) >= self._cache_size:
+                    self._npz_cache.pop(next(iter(self._npz_cache)))
+                self._npz_cache[file_path] = np.load(file_path, mmap_mode="r")
+            npz = self._npz_cache[file_path]
+
+            sl       = slice(start, start + self.clip_length)
+            raw_mv   = npz["motion_vectors"][sl]   # [T, H, W, 1] structured
+            raw_res  = npz["residuals"][sl]         # [T, H, W, 3] uint8
+            raw_cls  = npz["true_class"][sl]        # [T] int32
+            raw_box  = npz["boxes"][sl]             # [T, 4] float32
+            raw_ft   = npz["frame_types"][sl]       # [T] str
+
+            for t in range(self.clip_length):
+                if USE_MOTIONVECTORS:
+                    mv_raw = raw_mv[t]
+
+                    # NPZ stores MVs as plain int32 — must reinterpret as structured
+                    # dtype before accessing named fields (source, motion_x, etc.)
+                    mv = mv_raw.view(MV_STRUCT)
+
+                    # Squeeze trailing singleton dimension if present → [H, W]
+                    if mv.ndim == 3 and mv.shape[-1] == 1:
+                        mv = mv[..., 0]
+                    elif mv.ndim == 1:
+                        s  = int(round(len(mv) ** 0.5))
+                        mv = mv.reshape(s, s)
+
+                    # mv is now [H, W] structured → stack fields → [4, H, W]
+                    mv_grid = np.stack([
+                        mv['source'].astype(np.float32),
+                        mv['motion_x'].astype(np.float32),
+                        mv['motion_y'].astype(np.float32),
+                        mv['motion_scale'].astype(np.float32),
+                    ], axis=0)   # [4, H, W]
+
+                    mv_tensor = F.interpolate(
+                        torch.from_numpy(mv_grid).unsqueeze(0),  # [1, 4, H, W]
+                        size=(H_TOKENS, W_TOKENS),
+                        mode='nearest'
+                    ).squeeze(0)   # [4, H_TOKENS, W_TOKENS]
+                    mv_list.append(mv_tensor)
+
+                if USE_RESIDUALS:
+                    res = torch.from_numpy(
+                        raw_res[t].astype(np.float32) / 255.0
+                    ).permute(2, 0, 1)   # [3, H, W]
+                    res = F.interpolate(
+                        res.unsqueeze(0),
+                        size=(FRAME_H, FRAME_W), mode='bilinear', align_corners=False
+                    ).squeeze(0)
+                    res_list.append(res)
+
+                frame_types.append(str(raw_ft[t]))
+                boxes_list.append(torch.tensor(raw_box[t].tolist(), dtype=torch.float32))
+                cls_list.append(torch.tensor(int(raw_cls[t]), dtype=torch.long))
+
         else:
-            # Fallback for dummy data
-            clip = self.source_data[clip_idx]
+            # Fallback for in-memory dummy Clip objects
+            clip   = self.source_data[clip_idx]
+            frames = clip.frames[start:start + self.clip_length]
 
-        frames = clip.frames[start:start + self.clip_length]
+            for frame in frames:
+                if USE_MOTIONVECTORS:
+                    mv = frame.motion_vectors
 
-        # Iterate over frames in the clip
-        for frame in frames:
+                    if mv.ndim == 3 and mv.shape[-1] == 1:
+                        mv = mv[..., 0]
+                    elif mv.ndim == 1:
+                        s  = int(round(len(mv) ** 0.5))
+                        mv = mv.reshape(s, s)
 
-            if USE_MOTIONVECTORS:
-                mv = frame.motion_vectors
+                    mv_grid = np.stack([
+                        mv['source'].astype(np.float32),
+                        mv['motion_x'].astype(np.float32),
+                        mv['motion_y'].astype(np.float32),
+                        mv['motion_scale'].astype(np.float32),
+                    ], axis=0)
+                    mv_tensor = F.interpolate(
+                        torch.from_numpy(mv_grid).unsqueeze(0),
+                        size=(H_TOKENS, W_TOKENS), mode='nearest'
+                    ).squeeze(0)
+                    mv_list.append(mv_tensor)
 
-                if mv.ndim == 1:
-                    # flat format: [H*W]
-                    n_mv = len(mv)
-                    h_mv = int(round(n_mv ** 0.5))
-                    if h_mv * h_mv != n_mv:
-                        raise ValueError(
-                            f"Flat motion_vectors length {n_mv} is not a square grid"
-                        )
-                    w_mv = h_mv
+                if USE_RESIDUALS:
+                    res = torch.from_numpy(
+                        frame.residuals.astype(np.float32) / 255.0
+                    ).permute(2, 0, 1)
+                    res = F.interpolate(
+                        res.unsqueeze(0),
+                        size=(FRAME_H, FRAME_W), mode='bilinear', align_corners=False
+                    ).squeeze(0)
+                    res_list.append(res)
 
-                elif mv.ndim == 2:
-                    # grid format: [H, W]
-                    h_mv, w_mv = mv.shape
-
-                elif mv.ndim == 3:
-                    # grid with singleton channel: [H, W, 1]
-                    if mv.shape[-1] != 1:
-                        raise ValueError(
-                            f"Unexpected 3D motion_vectors shape: {mv.shape} "
-                            f"(expected last dim == 1)"
-                        )
-                    mv = mv[..., 0]
-                    h_mv, w_mv = mv.shape
-
-                else:
-                    raise ValueError(
-                        f"Unexpected motion_vectors ndim: {mv.ndim}, shape={mv.shape}"
-                    )
-
-                mv_grid = np.stack([
-                    mv['source'].astype(np.float32),
-                    mv['motion_x'].astype(np.float32),
-                    mv['motion_y'].astype(np.float32),
-                    mv['motion_scale'].astype(np.float32),
-                ], axis=0)
-
-                if mv.ndim == 1:
-                    mv_grid = mv_grid.reshape(4, h_mv, w_mv)
-
-                mv_tensor = torch.from_numpy(mv_grid)
-                
-                # RESIZE FIX: Force MVs to constant shape [4, H_TOKENS, W_TOKENS]
-                # We use 'nearest' because 'source' and 'motion_scale' are categorical numbers.
-                mv_tensor = F.interpolate(
-                    mv_tensor.unsqueeze(0), 
-                    size=(H_TOKENS, W_TOKENS), 
-                    mode='nearest'
-                ).squeeze(0)
-                
-                mv_list.append(mv_tensor)
-
-            if USE_RESIDUALS:
-                # [H, W, 3] uint8 → [3, H, W] float32 in [0, 1]
-                res = torch.from_numpy(
-                    frame.residuals.astype(np.float32) / 255.0
-                ).permute(2, 0, 1)
-                
-                # RESIZE FIX: Force Residuals to constant shape [3, FRAME_H, FRAME_W]
-                res = F.interpolate(
-                    res.unsqueeze(0), 
-                    size=(FRAME_H, FRAME_W), 
-                    mode='bilinear', 
-                    align_corners=False
-                ).squeeze(0)
-                
-                res_list.append(res)
-
-            # annotations (always included)
-            frame_types.append(frame.frame_type)
-            boxes_list.append(torch.tensor(frame.true_bounding_box, dtype=torch.float32))
-            cls_list.append(torch.tensor(frame.true_class, dtype=torch.long))
+                frame_types.append(frame.frame_type)
+                boxes_list.append(torch.tensor(frame.true_bounding_box, dtype=torch.float32))
+                cls_list.append(torch.tensor(frame.true_class, dtype=torch.long))
 
         sample = {
             "frame_types": frame_types,                      # list[str], length T

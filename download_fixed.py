@@ -29,9 +29,9 @@ import cv_reader
 # CONFIG
 CONFIG = {
     "MODE":            "DOWNLOAD",     # "CHECK" or "DOWNLOAD"
-    "MAX_VIDEOS":      10,             # Max number of videos to check/download
+    "MAX_VIDEOS":      2000,             # Max number of videos to check/download
     "MAX_WORKERS":     1,              # Number of parallel threads for downloading/checking
-    "TARGET_CLASSES":  [1],             # List of class IDs to download, e.g., [1, 23]. Leave empty [] for all.
+    "TARGET_CLASSES":  [],             # List of class IDs to download, e.g., [1, 23]. Leave empty [] for all.
     
     "OUTPUT_DIR":      "downloaded_videos/",
     "DATASET_DIR":     "dataset/",
@@ -266,40 +266,75 @@ def _extract_to_npz(video_path: str, output_npz: str, frame_h: int, frame_w: int
             mv_list.append(frame["motion_vector"])
             res_list.append(frame["residual"])
             
-        frame_types = np.array(type_list)
+        frame_types    = np.array(type_list)
         motion_vectors = np.array(mv_list)
-        residuals = np.array(res_list)
+        residuals      = np.array(res_list)
         
-        # 3. Match the bounding boxes (Your original logic)
+        # 3. Match bounding boxes from CSV annotations to frames
         matched_boxes_array = np.zeros((n_frames, 4), dtype=np.float32)
-        matched_class_array = np.full((n_frames,), -1, dtype=np.int32)
+        matched_class_array = np.full((n_frames,), np.nan)   # NaN = no label yet
         video_df = df[df["youtube_id"] == vid_id]
 
         for i in range(n_frames):
-            frame_global_time_ms = (chunk_start_time + (i / 30.0)) * 1000.0
+            frame_global_time_ms = (chunk_start_time + (i / CONFIG["FPS"])) * 1000.0
             matches = video_df[
-                (video_df["timestamp_ms"] >= frame_global_time_ms - 17) & 
+                (video_df["timestamp_ms"] >= frame_global_time_ms - 17) &
                 (video_df["timestamp_ms"] <= frame_global_time_ms + 17)
             ]
-            
             if not matches.empty:
                 row = matches.iloc[0]
                 matched_boxes_array[i] = [row["xmin"], row["xmax"], row["ymin"], row["ymax"]]
-                matched_class_array[i] = int(row["class_id"]) - 1
-                
-        # 4. Save the true data
+                matched_class_array[i] = int(row["class_id"]) - 1   # shift to 0-based
+
+        # Interpolate the gaps between annotations (up to 90 frames / 3 seconds)
+        df_boxes = pd.DataFrame(matched_boxes_array).replace(0, np.nan)
+        df_boxes = df_boxes.interpolate(method='linear', limit=90, limit_area='inside')
+        matched_boxes_array = df_boxes.fillna(0).values
+
+        # Forward/Backward fill the class IDs across the same gaps
+        df_classes = pd.Series(matched_class_array).replace(-1, np.nan)
+        df_classes = df_classes.ffill(limit=90).bfill(limit=90)
+        matched_class_array = df_classes.fillna(-1).values
+
+        # Linear interpolation of bounding boxes across unannotated frames.
+        # interpolate spatially between known anchor points (max gap: 90 frames = 3s)
+        interp_df = pd.DataFrame({
+            "xmin":  matched_boxes_array[:, 0],
+            "xmax":  matched_boxes_array[:, 1],
+            "ymin":  matched_boxes_array[:, 2],
+            "ymax":  matched_boxes_array[:, 3],
+            "cls":   matched_class_array,          # NaN where no annotation
+        })
+
+        # Mark rows without a CSV hit so interpolate() skips them correctly
+        no_hit_mask = np.isnan(interp_df["cls"])
+        interp_df.loc[no_hit_mask, ["xmin", "xmax", "ymin", "ymax"]] = np.nan
+
+        # Interpolate box coords linearly (limit=90 frames = 3 s max gap)
+        interp_df[["xmin", "xmax", "ymin", "ymax"]] = (
+            interp_df[["xmin", "xmax", "ymin", "ymax"]]
+            .interpolate(method="linear", limit=90, limit_direction="forward")
+        )
+
+        # Forward-fill class IDs only (never interpolate categorically)
+        interp_df["cls"] = interp_df["cls"].ffill()
+
+        # Convert back: any remaining NaN (padding before first annotation) → -1
+        final_class_array = interp_df["cls"].fillna(-1).astype(np.int32).values
+        final_boxes_array = interp_df[["xmin", "xmax", "ymin", "ymax"]].fillna(0.0).to_numpy(dtype=np.float32)
+
+        # 5. Save
         np.savez_compressed(
             output_npz,
             frame_types    = frame_types,
             motion_vectors = motion_vectors,
             residuals      = residuals,
-            boxes          = matched_boxes_array,
-            true_class     = matched_class_array,
+            boxes          = matched_boxes_array,    # Now these are interpolated!
+            true_class     = matched_class_array,    # Now these are filled!
         )
         return True
         
     except Exception as e:
-        # Using your thread-safe print
         tprint(f"Extraction failed for {vid_id}: {e}")
         return False
 

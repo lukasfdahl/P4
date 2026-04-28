@@ -69,27 +69,32 @@ torch.manual_seed(SEED)
 
 # loading helper, lazy because not all in ram haha
 def lazy_build_window_index(
-    npz_files: list[str],
-    clip_length: int,
-    stride: int,
+    npz_files:      list[str],
+    clip_length:    int,
+    stride:         int,
     snap_to_iframe: bool = True,
-    filter_empty: bool = False,       # ← add this
+    filter_empty:   bool = False,
+    target_classes: list[int] | None = None,
 ) -> list[tuple[int, int]]:
+    
+    # Convert original 1-based IDs → stored 0-based IDs for O(1) lookup
+    target_set = (
+        {c - 1 for c in target_classes} if target_classes is not None else None
+    )
+
     window_index = []
-    filtered = 0   
-    """Builds sliding windows by only reading the lightweight metadata of the NPZ files to save RAM."""
+    filtered     = 0
 
     for file_idx, file_path in enumerate(npz_files):
-        # FAST LOAD: Only load the frame_types string array, skip the heavy residuals
-        data = np.load(file_path)
+        data        = np.load(file_path)
         frame_types = data["frame_types"]
-        
-        n = len(frame_types)
+        true_class  = data["true_class"]   # int32, -1 = no annotation
 
+        n = len(frame_types)
         if n < clip_length:
             continue
 
-        starts = list(range(0, n - clip_length + 1, stride))
+        starts     = list(range(0, n - clip_length + 1, stride))
         last_valid = n - clip_length
         if starts and starts[-1] != last_valid:
             starts.append(last_valid)
@@ -98,7 +103,7 @@ def lazy_build_window_index(
         for start in starts:
             if snap_to_iframe:
                 search_radius = stride // 2
-                best_start = start
+                best_start    = start
                 for offset in range(-search_radius, search_radius + 1):
                     idx = start + offset
                     if 0 <= idx <= n - clip_length and frame_types[idx] == 'I':
@@ -106,13 +111,22 @@ def lazy_build_window_index(
                         break
                 start = best_start
 
-            if start not in seen:
-                seen.add(start)
+            if start in seen:
+                continue
+            seen.add(start)
 
-                window_index.append((file_idx, start))
+            # Drop windows with no frame belonging to a target class
+            if target_set is not None:
+                window_classes = set(true_class[start : start + clip_length].tolist())
+                if not window_classes.intersection(target_set):
+                    filtered += 1
+                    continue
+
+            window_index.append((file_idx, start))
+
     print(
         f"[lazy] built {len(window_index)} windows "
-        f"(filtered={filtered} empty)"  
+        f"(skipped {filtered} with no target class)"
     )
     return window_index
 
@@ -346,16 +360,17 @@ def _make_video_splits(n_videos: int) -> dict[str, set[int]]:
 
 #build dataloader?
 def build_data_loaders(
-    clips: list[Clip] | None = None,
-    npz_dir: str | None = None,
-    clip_length: int = CLIP_LENGTH,
-    stride: int = CLIP_LENGTH,
+    clips:          list[Clip] | None = None,
+    npz_dir:        str | None = None,
+    clip_length:    int = CLIP_LENGTH,
+    stride:         int = CLIP_LENGTH,
     snap_to_iframe: bool = True,
-    limit_1_video: bool = False,
-    max_files: int | None = None,
-    batch_size: int = BATCH_SIZE,
-    num_workers: int = NUM_WORKERS,
-    pin_memory: bool = False,
+    limit_1_video:  bool = False,
+    max_files:      int | None = None,
+    batch_size:     int = BATCH_SIZE,
+    num_workers:    int = NUM_WORKERS,
+    pin_memory:     bool = False,
+    target_classes: list[int] | None = None,
 ) -> tuple[DataLoader, DataLoader | list, DataLoader | list]:
     """
     Three ways to call this:
@@ -369,9 +384,18 @@ def build_data_loaders(
 
         build_data_loaders()
             -> generates 200 synthetic dummy clips for testing
- 
+
+    target_classes : list[int] | None
+        Original YouTube-BB class IDs (1-based) to keep, e.g. [1, 2, 3].
+        Windows with no matching frame are skipped at index-build time.
+        Class IDs are NOT remapped — class 22 stays 22, num_classes stays 23.
+        Pass None to use all classes.
+
     Returns (train_loader, val_loader, test_loader).
     """
+    if target_classes is not None:
+        print(f"[DataLoader] Class filter: keeping YouTube-BB classes {sorted(target_classes)} (no remapping)")
+
     if clips is not None:
         source_data = clips
         if limit_1_video:
@@ -389,17 +413,17 @@ def build_data_loaders(
         if limit_1_video:
             npz_files = npz_files[:1]
             
-        source_data = npz_files
+        source_data  = npz_files
         window_index = lazy_build_window_index(
             source_data, clip_length=clip_length,
             stride=stride, snap_to_iframe=snap_to_iframe,
             filter_empty=True,
+            target_classes=target_classes,
         )
-
 
     else:
         # Fallback dummy logic
-        source_data = build_dummy_dataset()
+        source_data  = build_dummy_dataset()
         window_index = build_window_index(
             source_data, clip_length=clip_length,
             stride=stride, snap_to_iframe=snap_to_iframe,

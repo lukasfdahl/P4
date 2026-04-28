@@ -570,6 +570,7 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
             batch_size=cfg_train["batch_size"],
             num_workers=cfg_train.get("num_workers", 4),
             pin_memory=(device.type == "cuda"),
+            target_classes=cfg["data"].get("target_classes") or None,
         )
 
     # debug

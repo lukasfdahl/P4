@@ -4,7 +4,7 @@
 # train.py loads this file and logs its full contents to the run directory
 # so every checkpoint is reproducible.
 
-experiment_name: "test_100_videos"
+experiment_name: "test_100_videos_from_1500"
 run_name:        "run01_100videos_3class"
 
 
@@ -17,7 +17,7 @@ resume: null
 # All values here are forwarded directly to ObjectDetector.__init__()
 
 model:
-  num_classes:        23      # YouTube-BB: 23 classes, IDs 1-23 shifted to 0-22
+  num_classes:        23      # YouTube-BB: 23 classes, IDs 1-23 shifted to 0-22.
   scales:             [8, 16, 32]
   base_mv_scale:      16       # native H.264 MV block size — don't change
   clip_length:        5        # frames per forward pass — must match data.clip_length
@@ -31,14 +31,14 @@ model:
 
 # Data pipeline
 data:
-  npz_dir:          "dataset/"   # directory of .npz files from extractor.py
+  npz_dir:          "dataset/"
   frame_h:          64
   frame_w:          64
   clip_length:      5          # must match model.clip_length
   stride:           4          # sliding-window stride (frames).
                                # stride=clip_length → no overlap (fastest)
                                # stride=1           → maximum overlap (slowest, most clips)
-  snap_to_iframe:   true       # start each window on an I-frame when possible
+  snap_to_iframe:   true
   use_motionvectors: true
   use_residuals:    true
   train_ratio:      0.7
@@ -46,13 +46,16 @@ data:
   test_ratio:       0.0
   max_files:        100
 
+  # Class filter — only windows containing at least one of these classes are loaded.
+  target_classes:   [1, 2, 3]
+
 # Training loop
 training:
   epochs:        50
-  batch_size:    16
+  batch_size:    256
   seed:          42
-  num_workers:   12
-  lr:            1.0e-4
+  num_workers:   6
+  lr:            3.0e-4
   weight_decay:  0
   grad_clip:     1.0           # max gradient norm — important for transformer stability
 

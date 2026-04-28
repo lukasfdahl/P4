@@ -5,7 +5,8 @@ from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
 from typing import Optional
 
 from data_classes import Clip, Frame
-from npz_importer import import_clip
+# NOTE: npz_importer intentionally not imported at module level — it loads
+# the full 400MB CSV on import which runs in every dataloader worker.
 
 #list of functions needed:
 # sliding_window function
@@ -201,9 +202,12 @@ def load_clips_from_npz_dir(
     max_files: int | None = None,
 ) -> list[Clip]:
     """
-    Load .npz videos from a directory and convert them to long Clip objects
-    without windowing to prevent RAM explosion.
+    Load .npz videos from a directory and convert them to long Clip objects.
+    import_clip is imported here (not at module level) to avoid triggering
+    the 400MB CSV load in dataloader workers who never call this function.
     """
+    from npz_importer import import_clip  # lazy import — safe here
+
     npz_files = sorted(
         os.path.join(npz_dir, f)
         for f in os.listdir(npz_dir)

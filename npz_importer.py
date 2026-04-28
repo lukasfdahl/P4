@@ -94,12 +94,10 @@ def import_clip(clip_path : str) -> Clip:
 
 
 
-download_dataset() # just to ensure the dataset is downloaded no matter what.
-labels = import_dataset()
-
-
-# some test code i made
 if __name__ == "__main__":
+    download_dataset()
+    labels = import_dataset()
+
     test_clip = import_clip("downloaded_videos/test video.npz")
     print(len(test_clip.frames))
     print("frame 0:")
@@ -117,5 +115,3 @@ if __name__ == "__main__":
     print("Frame 100 Bounding Box:", test_clip.frames[100].true_bounding_box)
     print("Frame 100 Class ID:", test_clip.frames[100].true_class)
     print(np.all(test_clip.frames[100].motion_vectors['motion_x'] == 0)) # was all the motion vectors still (which is not expected since it is an B frame)
-    
-    

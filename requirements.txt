@@ -15,3 +15,5 @@ torchview
 graphviz
 pynvml
 tqdm
+
+torch-linear-assignment

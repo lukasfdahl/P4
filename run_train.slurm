@@ -4,8 +4,9 @@
 #####################
 
 #SBATCH --job-name=objectdetect
-#SBATCH --output=V2_overfit%j.out
-#SBATCH --error=V2_overfit%j.err
+#SBATCH --begin=2026-05-01T00:00:01
+#SBATCH --output=overfit%j.out
+#SBATCH --error=overfit%j.err
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=15
 #SBATCH --mem=24G
@@ -17,9 +18,8 @@ echo "=========================================================="
 echo "Job is running on compute node: $SLURMD_NODENAME"
 echo ""
 echo "To view MLflow, open a NEW terminal on your LOCAL laptop and run:"
-echo "ssh -N -L 8501:$SLURMD_NODENAME:8501 <YOUR_USERNAME>@<YOUR_LOGIN_NODE_IP>"
-echo ""
-echo "Then open your browser to: http://localhost:8501"
+echo "ssh -N -L ${MLFLOW_PORT}:$SLURMD_NODENAME:${MLFLOW_PORT} <USER>@<LOGIN_NODE>"
+echo "Then open: http://localhost:${MLFLOW_PORT}"
 echo "=========================================================="
 
 #####################
@@ -41,8 +41,16 @@ singularity exec --nv -B $PWD:$PWD $CONTAINER \
 #####################
 echo "Running on node: $SLURMD_NODENAME"
 
+MLFLOW_PORT=$((8500 + SLURM_JOB_ID % 1000))
+TBBOARD_PORT=$((9500 + SLURM_JOB_ID % 1000))
+
+echo "MLflow port:      $MLFLOW_PORT"
+echo "TensorBoard port: $TBBOARD_PORT"
+
 singularity exec --nv -B $PWD:$PWD $CONTAINER \
-    python3 -m mlflow server --host 0.0.0.0 --port 8501 \
+    python3 -m mlflow server \
+    --host 0.0.0.0 \
+    --port $MLFLOW_PORT \
     --gunicorn-opts "--access-logfile /dev/null" 2>&1 | grep -v "^INFO:" &
 
 sleep 5
@@ -50,5 +58,7 @@ sleep 5
 #####################
 # 4. Run Training
 #####################
+# run_train.slurm — change the python3 line to:
 singularity exec --nv -B $PWD:$PWD $CONTAINER \
-    python3 train.py
+    MLFLOW_PORT=$MLFLOW_PORT \
+    python3 train.py --config ${CONFIG:-config.yaml}

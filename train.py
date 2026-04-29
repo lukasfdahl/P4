@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
-from scipy.optimize import linear_sum_assignment
+from torch_linear_assignment import linear_sum_assignment as gpu_lsa
 
 from model      import ObjectDetector
 from dataloader import build_data_loaders
@@ -108,55 +108,63 @@ def compute_loss(
     total_cls  = pred_boxes.new_tensor(0.0)
     valid_frames = 0
 
+    # ── Phase 1: build all cost matrices on GPU, transfer the whole batch at once ──
+    # Each sample may have a different number of valid GT boxes, so we can't stack
+    # into one tensor. Instead we collect the GPU tensors, do a single .cpu() call
+    # per sample but defer it until we've built all of them — this keeps the GPU
+    # busy computing the next sample's cost while the PCIe transfer for the previous
+    # one is in flight, rather than stalling after every individual sample.
+    valid_masks   = [gt_classes[b] != -1 for b in range(B)]
+    valid_gt_boxes_list   = [gt_boxes[b][valid_masks[b]]   for b in range(B)]
+    valid_gt_classes_list = [gt_classes[b][valid_masks[b]] for b in range(B)]
+
+    # Build every cost matrix on GPU first, then batch-transfer to CPU.
+    cost_matrices_gpu = []
+
+    # calc time to see if it is bottleneck, could be rm if not needed
+    start_time = time.perf_counter()
+
     for b in range(B):
-        # 1. Filter out padded/empty GT frames (where class == -1)
-        valid_mask = gt_classes[b] != -1
-        valid_gt_boxes = gt_boxes[b][valid_mask]      # [num_gt, 4]
-        valid_gt_classes = gt_classes[b][valid_mask]  # [num_gt]
-        
-        num_gt = valid_gt_boxes.shape[0]
+        num_gt = valid_gt_boxes_list[b].shape[0]
         if num_gt == 0:
+            cost_matrices_gpu.append(None)
             continue
-            
-        # 2. Build the Cost Matrix [num_queries, num_gt]
-        # Class cost: We want to MAXIMIZE probability, so cost is negative probability
-        out_prob = probs[b] 
-        cost_class = -out_prob[:, valid_gt_classes] 
-        
-        # L1 Bounding Box Cost: pairwise distance
-        cost_l1 = torch.cdist(pred_boxes[b], valid_gt_boxes, p=1)
-        
-        # GIoU Cost: pairwise loop, rm loop version
 
-        # GIoU Cost: Fully vectorized using broadcasting
-        # pred_boxes[b] shape: [num_queries, 4] -> unsqueeze(1) -> [num_queries, 1, 4]
-        # valid_gt_boxes shape: [num_gt, 4]     -> unsqueeze(0) -> [1, num_gt, 4]
-        # giou_loss broadcasts these together to calculate the [num_queries, num_gt] matrix instantly.
-
-        cost_giou = giou_loss(
+        out_prob   = probs[b]                                          # [Q, C]
+        cost_class = -out_prob[:, valid_gt_classes_list[b]]            # [Q, num_gt]
+        cost_l1    = torch.cdist(pred_boxes[b], valid_gt_boxes_list[b], p=1)  # [Q, num_gt]
+        cost_giou  = giou_loss(
             pred_boxes[b].unsqueeze(1),
-            valid_gt_boxes.unsqueeze(0)
-        )
-                
-        # 3. Combine into final Cost Matrix and move to CPU for SciPy
+            valid_gt_boxes_list[b].unsqueeze(0),
+        )                                                              # [Q, num_gt]
+
         C = (w_cls * cost_class) + (w_l1 * cost_l1) + (w_giou * cost_giou)
-        C_np = C.detach().cpu().numpy()
-        
-        # 4. HUNGARIAN MATCHER (Bipartite Matching)
-        row_ind, col_ind = linear_sum_assignment(C_np)
-        
-        # 5. Compute actual Loss using the optimal assignments
-        for q_idx, gt_idx in zip(row_ind, col_ind):
-            matched_box = pred_boxes[b, q_idx]
-            matched_logit = pred_classes[b, q_idx]
-            actual_gt_box = valid_gt_boxes[gt_idx]
-            actual_gt_cls = valid_gt_classes[gt_idx]
-            
-            total_l1   += F.l1_loss(matched_box, actual_gt_box)
-            total_giou += giou_loss(matched_box.unsqueeze(0), actual_gt_box.unsqueeze(0)).squeeze()
-            total_cls  += F.cross_entropy(matched_logit.unsqueeze(0), actual_gt_cls.unsqueeze(0)).squeeze()
-            
-            valid_frames += 1
+        cost_matrices_gpu.append(C)
+
+    # ── Phase 2: Hungarian matching directly on GPU ──
+    for b in range(B):
+        C = cost_matrices_gpu[b]
+        if C is None:
+            continue
+
+        # C is already on the GPU [Q, num_gt]. 
+        # gpu_lsa returns torch tensors on the same device.
+        row_ind, col_ind = gpu_lsa(C)
+
+        # Cast to long explicitly just to be safe for indexing
+        row_t = row_ind.to(dtype=torch.long)
+        col_t = col_ind.to(dtype=torch.long)
+
+        matched_boxes    = pred_boxes[b][row_t]
+        matched_logits   = pred_classes[b][row_t]
+        matched_gt_boxes = valid_gt_boxes_list[b][col_t]
+        matched_gt_cls   = valid_gt_classes_list[b][col_t]
+
+        M = row_t.shape[0]
+        total_l1   += F.l1_loss(matched_boxes, matched_gt_boxes)
+        total_giou += giou_loss(matched_boxes, matched_gt_boxes).mean()
+        total_cls  += F.cross_entropy(matched_logits, matched_gt_cls)
+        valid_frames += M
 
     # Safe return if the entire batch happens to be empty clips
     if valid_frames == 0:
@@ -171,6 +179,9 @@ def compute_loss(
     total_cls  = total_cls  / valid_frames
 
     total = (w_cls * total_cls) + (w_l1 * total_l1) + (w_giou * total_giou)
+
+    end_time = time.perf_counter()
+    print(f"Cost computation time: {end_time - start_time:.4f} seconds")
 
     return total, {
         "loss_total": total.item(),
@@ -201,15 +212,15 @@ def train_one_epoch(
     for batch in pbar:
         
         # move to device
-        gt_boxes   = batch["boxes"].to(device)       # [B, T, 4]
-        gt_classes = batch["true_class"].to(device)  # [B, T]
+        gt_boxes   = batch["boxes"].to(device, non_blocking=True)       # [B, T, 4]
+        gt_classes = batch["true_class"].to(device, non_blocking=True)  # [B, T]
         mv         = batch.get("motion_vectors")
         res        = batch.get("residuals")
         frame_types = batch["frame_types"]            # list[list[str]], shape [B][T]
 
         # as we want to experiment, test with one of them
-        if mv  is not None: mv  = mv.to(device)
-        if res is not None: res = res.to(device)
+        if mv  is not None: mv  = mv.to(device, non_blocking=True)
+        if res is not None: res = res.to(device, non_blocking=True)
 
         # frame_types for the model: it expects a flat list of length T (one per frame).
         # All clips in a batch share the same frame-type sequence (same clip_length),
@@ -217,7 +228,9 @@ def train_one_epoch(
         ft_sequence = frame_types[0]  # list[str] length T
 
         # forward calculation
-        optimizer.zero_grad()
+        # set_to_none=True drops gradient references instead of zeroing buffers —
+        # saves a full GPU memset write-pass over all parameters every step.
+        optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             pred_boxes, pred_classes = model(mv, res, ft_sequence)
@@ -271,28 +284,31 @@ def validate(
     all_frame_gts   = []
     sample_images   = []  # one image per clip (frame 0), for the overview plot
 
-    # Temporal analysis: store full clip data from the first batch so we can
-    # visualise how predictions evolve across the T frames of a single clip.
-    # Each entry covers one clip and contains:
-    #   "images"   : List[np.ndarray]       – all T residual frames (H,W,C)
-    #   "gt_per_t" : List[List[BoundingBox]] – GT boxes at each time-step t
-    #   "boxes"    : np.ndarray [Q, 4]      – clip-level predicted boxes
-    #   "cls_ids"  : np.ndarray [Q]         – argmax class per query
-    #   "confs"    : np.ndarray [Q]         – max softmax confidence per query
-    # The model outputs one set of Q queries for the whole clip (not per frame),
-    # so hopping is visible by comparing the best-matching query across each
-    # frame's GT annotations over time.
-    temporal_clips: list = []  # filled from batch 0 only
+    # Temporal analysis: store raw GPU tensors during the loop and only call
+    # .cpu() / .numpy() once after the loop ends, in a single bulk transfer.
+    # This avoids per-frame CUDA sync points inside the hot validation path.
+    # Stored as GPU tensors keyed per clip; converted to numpy after the loop.
+    _vis_res_gpu:        list[torch.Tensor] = []  # [T, 3, H, W] per clip, batch 0
+    _vis_gt_boxes_gpu:   list[torch.Tensor] = []  # [T, 4] per clip, batch 0
+    _vis_gt_classes_gpu: list[torch.Tensor] = []  # [T]    per clip, batch 0
+    _vis_boxes_gpu:      list[torch.Tensor] = []  # [Q, 4] per clip, batch 0
+    _vis_cls_ids_gpu:    list[torch.Tensor] = []  # [Q]    per clip, batch 0
+    _vis_confs_gpu:      list[torch.Tensor] = []  # [Q]    per clip, batch 0
+
+    CONF_THRESHOLD = 0.5
+    MAX_PREDS_CLIP = 10
+
+    temporal_clips: list = []  # filled from batch 0 GPU tensors after the loop
 
     for i, batch in enumerate(tqdm(loader, desc="  val  ", leave=False, unit="batch")):
-        gt_boxes = batch["boxes"].to(device)
-        gt_classes = batch["true_class"].to(device)
+        gt_boxes = batch["boxes"].to(device, non_blocking=True)
+        gt_classes = batch["true_class"].to(device, non_blocking=True)
         mv = batch.get("motion_vectors")
         res = batch.get("residuals")
         ft_sequence = batch["frame_types"][0]
         
-        if mv is not None: mv = mv.to(device)
-        if res is not None: res = res.to(device)
+        if mv is not None: mv = mv.to(device, non_blocking=True)
+        if res is not None: res = res.to(device, non_blocking=True)
 
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             pred_boxes, pred_logits = model(mv, res, ft_sequence)
@@ -318,6 +334,10 @@ def validate(
             torch.maximum(pred_boxes[..., 2], pred_boxes[..., 3]),  # ymax
         ], dim=-1)  # [B, Q, 4]
 
+        # Vectorised confidence filtering: do it on GPU, transfer only the
+        # final scalar candidates rather than calling .item() per query.
+        confs_batch, cls_ids_batch = torch.max(probs, dim=-1)  # [B, Q], [B, Q]
+
         for b in range(B):
             frame_preds = []
             frame_gts = []
@@ -328,90 +348,100 @@ def validate(
             # The top-K cap (default 10) prevents a flood of near-threshold
             # queries from drowning out the true positives in both the metrics
             # and the visualisation — without any spatial suppression (no NMS).
-            CONF_THRESHOLD  = 0.5
-            MAX_PREDS_CLIP  = 10
+            confs   = confs_batch[b]    # [Q] — still on GPU
+            cls_ids = cls_ids_batch[b]  # [Q] — still on GPU
 
-            confs, cls_ids = torch.max(probs[b], dim=-1)  # [Q], [Q]
+            # Filter and top-K entirely on GPU; one .cpu() for the whole result
+            mask = confs >= CONF_THRESHOLD           # [Q] bool
+            cand_confs   = confs[mask]               # [M]
+            cand_cls     = cls_ids[mask]             # [M]
+            cand_boxes   = boxes_eval[b][mask]       # [M, 4]
+            topk = min(MAX_PREDS_CLIP, cand_confs.shape[0])
+            if topk > 0:
+                topk_idx     = torch.argsort(cand_confs, descending=True)[:topk]
+                # Single .cpu() call for all candidates at once
+                cand_confs_np  = cand_confs[topk_idx].cpu().numpy()
+                cand_cls_np    = cand_cls[topk_idx].cpu().numpy()
+                cand_boxes_np  = cand_boxes[topk_idx].cpu().numpy()
+                for k_idx in range(topk):
+                    frame_preds.append(Prediction(
+                        xmin=float(cand_boxes_np[k_idx, 0]),
+                        xmax=float(cand_boxes_np[k_idx, 1]),
+                        ymin=float(cand_boxes_np[k_idx, 2]),
+                        ymax=float(cand_boxes_np[k_idx, 3]),
+                        class_id=int(cand_cls_np[k_idx]),
+                        confidence=float(cand_confs_np[k_idx]),
+                    ))
 
-            # 1. Collect all queries that clear the confidence threshold
-            candidates = []
-            for q in range(Q):
-                conf   = confs[q].item()
-                cls_id = cls_ids[q].item()
-                if conf >= CONF_THRESHOLD:
-                    candidates.append((conf, q, cls_id))
+            # Collect GTs: transfer gt_boxes/gt_classes for this clip in one go
+            T_frames = gt_boxes.shape[1]
+            valid_mask_gt = gt_classes[b] != -1           # [T] bool on GPU
+            valid_gt_b    = gt_boxes[b][valid_mask_gt]    # [M, 4] on GPU
+            valid_cls_b   = gt_classes[b][valid_mask_gt]  # [M]    on GPU
+            if valid_gt_b.shape[0] > 0:
+                valid_gt_np  = valid_gt_b.cpu().numpy()
+                valid_cls_np = valid_cls_b.cpu().numpy()
+                for m in range(valid_gt_np.shape[0]):
+                    frame_gts.append(BoundingBox(
+                        xmin=float(valid_gt_np[m, 0]),
+                        xmax=float(valid_gt_np[m, 1]),
+                        ymin=float(valid_gt_np[m, 2]),
+                        ymax=float(valid_gt_np[m, 3]),
+                        class_id=int(valid_cls_np[m]),
+                    ))
 
-            # 2. Keep only the top-K by confidence
-            candidates.sort(reverse=True)
-            for conf, q, cls_id in candidates[:MAX_PREDS_CLIP]:
-                p = Prediction(
-                    xmin=boxes_eval[b, q, 0].item(),
-                    xmax=boxes_eval[b, q, 1].item(),
-                    ymin=boxes_eval[b, q, 2].item(),
-                    ymax=boxes_eval[b, q, 3].item(),
-                    class_id=cls_id,
-                    confidence=conf,
-                )
-                frame_preds.append(p)
-            
-            # 2. Collect GTs for this clip.
-            # We keep all valid annotations across the T frames without deduplicating
-            # them, so they properly display in the visuals.
-            T = gt_boxes.shape[1]
-            for t in range(T):
-                if gt_classes[b, t] == -1:
-                    continue
-                cls_t  = int(gt_classes[b, t].item())
-                
-                gt = BoundingBox(
-                    xmin=gt_boxes[b, t, 0].item(), 
-                    xmax=gt_boxes[b, t, 1].item(),
-                    ymin=gt_boxes[b, t, 2].item(), 
-                    ymax=gt_boxes[b, t, 3].item(),
-                    class_id=cls_t,
-                )
-                frame_gts.append(gt)
-            
             all_frame_preds.append(frame_preds)
             all_frame_gts.append(frame_gts)
 
-            # Overview plot: store frame-0 image for first 4 clips of batch 0
+            # Overview plot: keep first 4 frame-0 images from batch 0 as GPU tensors
             if i == 0 and b < 4 and res is not None:
-                img = res[b, 0].cpu().permute(1, 2, 0).numpy()
-                sample_images.append(img)
+                sample_images.append(res[b, 0])  # [3, H, W] GPU — transferred below
 
-            # Temporal plot: store ALL T frames + raw query outputs for batch 0
+            # Temporal plot: stash raw GPU tensors for batch 0, transfer after loop
             if i == 0 and res is not None:
-                T_frames = res.shape[1]  # number of time-steps in the clip
+                _vis_res_gpu.append(res[b])             # [T, 3, H, W]
+                _vis_gt_boxes_gpu.append(gt_boxes[b])   # [T, 4]
+                _vis_gt_classes_gpu.append(gt_classes[b])
+                _vis_boxes_gpu.append(boxes_eval[b])    # [Q, 4]
+                _vis_cls_ids_gpu.append(cls_ids)         # [Q]
+                _vis_confs_gpu.append(confs)             # [Q]
 
-                # All T residual frames for this clip
-                clip_images = [
-                    res[b, t].cpu().permute(1, 2, 0).numpy()
-                    for t in range(T_frames)
-                ]
+    # ── Single bulk CPU transfer for all visualisation tensors ──────────────
+    # Everything above stayed on GPU during the loop; we pay the PCIe cost once.
+    if sample_images:
+        # sample_images is a list of [3,H,W] GPU tensors → stack → one transfer
+        sample_images_np = torch.stack(sample_images).cpu().permute(0, 2, 3, 1).numpy()
+        sample_images = [sample_images_np[k] for k in range(sample_images_np.shape[0])]
 
-                # Per-time-step GT boxes (raw, not deduplicated — we want to
-                # see which frames actually have an annotation)
-                gt_per_t = []
-                for t in range(T_frames):
-                    t_gts = []
-                    if gt_classes[b, t] != -1:
-                        t_gts.append(BoundingBox(
-                            xmin=gt_boxes[b, t, 0].item(),
-                            xmax=gt_boxes[b, t, 1].item(),
-                            ymin=gt_boxes[b, t, 2].item(),
-                            ymax=gt_boxes[b, t, 3].item(),
-                            class_id=int(gt_classes[b, t].item()),
-                        ))
-                    gt_per_t.append(t_gts)
+    if _vis_res_gpu:
+        res_np      = torch.stack(_vis_res_gpu).cpu()       # [N, T, 3, H, W]
+        gt_boxes_np = torch.stack(_vis_gt_boxes_gpu).cpu()  # [N, T, 4]
+        gt_cls_np   = torch.stack(_vis_gt_classes_gpu).cpu()# [N, T]
+        boxes_np    = torch.stack(_vis_boxes_gpu).cpu()     # [N, Q, 4]
+        cls_ids_np  = torch.stack(_vis_cls_ids_gpu).cpu()   # [N, Q]
+        confs_np    = torch.stack(_vis_confs_gpu).cpu()     # [N, Q]
 
-                temporal_clips.append({
-                    "images":   clip_images,
-                    "gt_per_t": gt_per_t,
-                    "boxes":    boxes_eval[b].cpu().numpy(),   # [Q, 4]
-                    "cls_ids":  cls_ids.cpu().numpy(),          # [Q]
-                    "confs":    confs.cpu().numpy(),            # [Q]
-                })
+        for b in range(res_np.shape[0]):
+            clip_images = [res_np[b, t].permute(1, 2, 0).numpy() for t in range(res_np.shape[1])]
+            gt_per_t = []
+            for t in range(gt_cls_np.shape[1]):
+                t_gts = []
+                if gt_cls_np[b, t].item() != -1:
+                    t_gts.append(BoundingBox(
+                        xmin=float(gt_boxes_np[b, t, 0]),
+                        xmax=float(gt_boxes_np[b, t, 1]),
+                        ymin=float(gt_boxes_np[b, t, 2]),
+                        ymax=float(gt_boxes_np[b, t, 3]),
+                        class_id=int(gt_cls_np[b, t]),
+                    ))
+                gt_per_t.append(t_gts)
+            temporal_clips.append({
+                "images":   clip_images,
+                "gt_per_t": gt_per_t,
+                "boxes":    boxes_np[b].numpy(),
+                "cls_ids":  cls_ids_np[b].numpy(),
+                "confs":    confs_np[b].numpy(),
+            })
 
     # Average losses
     avg_losses = {k: v / n_batches for k, v in totals.items()}
@@ -494,12 +524,20 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
     
     # Optional: Set tracking URI if your MLflow server is running on a specific host/port
     # If running locally in the same folder, it defaults to a local ./mlruns directory
-    mlflow.set_tracking_uri("http://localhost:8501") 
+    mlflow_port = os.environ.get("MLFLOW_PORT", "8501")
+    mlflow.set_tracking_uri(f"http://localhost:{mlflow_port}")
     mlflow.set_experiment(exp_name)
 
     # The previous `with` block closed right after log_params(), before the model
     # was built, so all log_metrics() calls in the epoch loop were outside the run.
-    mlflow.start_run(run_name=cfg.get("run_name", "training_run"))
+    run_name = cfg.get("run_name", "training_run")
+    config_name = os.path.basename(config_path).replace(".yaml", "")
+    mlflow.start_run(run_name=f"{run_name}_{config_name}")
+
+
+    mlflow.set_tag("config_name", config_name)
+
+
     mlflow.log_dict(cfg, "config.yaml")
     mlflow.log_params({
         "lr": cfg_train["lr"],

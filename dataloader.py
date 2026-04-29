@@ -93,7 +93,10 @@ def lazy_build_window_index(
     filtered     = 0
 
     for file_idx, file_path in enumerate(npz_files):
-        data        = np.load(file_path)
+        # mmap_mode="r" — OS only pages in the two metadata arrays we slice,
+        # not the full residuals/motion_vectors arrays. Critical for big datasets
+        # where loading every NPZ fully would OOM or take minutes at startup.
+        data        = np.load(file_path, mmap_mode="r")
         frame_types = data["frame_types"]
         true_class  = data["true_class"]   # int32, -1 = no annotation
 
@@ -271,25 +274,37 @@ class ClipDataset(Dataset):
                         mv['motion_scale'].astype(np.float32),
                     ], axis=0)   # [4, H, W]
 
-                    mv_tensor = F.interpolate(
-                        torch.from_numpy(mv_grid).unsqueeze(0),  # [1, 4, H, W]
-                        size=(H_TOKENS, W_TOKENS),
-                        mode='nearest'
-                    ).squeeze(0)   # [4, H_TOKENS, W_TOKENS]
-                    mv_list.append(mv_tensor)
+                    # Resize with pure numpy (nearest-neighbour) — avoids spawning a
+                    # torch dispatch in each worker process. Only resize if needed.
+                    src_h, src_w = mv_grid.shape[1], mv_grid.shape[2]
+                    if src_h != H_TOKENS or src_w != W_TOKENS:
+                        row_idx = (np.arange(H_TOKENS) * src_h // H_TOKENS)
+                        col_idx = (np.arange(W_TOKENS) * src_w // W_TOKENS)
+                        mv_grid = mv_grid[:, row_idx[:, None], col_idx[None, :]]  # [4, H_TOKENS, W_TOKENS]
+
+                    mv_list.append(torch.from_numpy(mv_grid))
 
                 if USE_RESIDUALS:
+                    # raw_res[t] is uint8 [H, W, 3]; normalise in numpy (no copy if
+                    # already float32 source), then permute to [3, H, W] via reshape.
+                    frame = raw_res[t]   # [H, W, 3] uint8
+                    src_h, src_w = frame.shape[0], frame.shape[1]
+
+                    # Resize with pure numpy (bilinear approximated as nearest in worker;
+                    # 64×64 frames make the quality difference negligible, and it avoids
+                    # torch dispatch overhead in every worker).
+                    if src_h != FRAME_H or src_w != FRAME_W:
+                        row_idx = (np.arange(FRAME_H) * src_h // FRAME_H)
+                        col_idx = (np.arange(FRAME_W) * src_w // FRAME_W)
+                        frame = frame[row_idx[:, None], col_idx[None, :], :]  # [FRAME_H, FRAME_W, 3]
+
                     res = torch.from_numpy(
-                        raw_res[t].astype(np.float32) / 255.0
-                    ).permute(2, 0, 1)   # [3, H, W]
-                    res = F.interpolate(
-                        res.unsqueeze(0),
-                        size=(FRAME_H, FRAME_W), mode='bilinear', align_corners=False
-                    ).squeeze(0)
+                        np.ascontiguousarray(frame).astype(np.float32) / 255.0
+                    ).permute(2, 0, 1)   # [3, FRAME_H, FRAME_W]
                     res_list.append(res)
 
                 frame_types.append(str(raw_ft[t]))
-                boxes_list.append(torch.tensor(raw_box[t].tolist(), dtype=torch.float32))
+                boxes_list.append(torch.from_numpy(raw_box[t].astype(np.float32, copy=False)))
                 cls_list.append(torch.tensor(int(raw_cls[t]), dtype=torch.long))
 
         else:

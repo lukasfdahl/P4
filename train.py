@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, ReduceLROnPlateau, SequentialLR
 from torch_linear_assignment import linear_sum_assignment as gpu_lsa
 
 from model      import ObjectDetector
@@ -15,7 +15,6 @@ from helpers import (
     clips_from_long_videos,
     save_checkpoint,
     load_checkpoint,
-    make_warmup_scheduler,
     xyxy_to_xywh,
     load_clips_from_npz_dir,
 )
@@ -85,109 +84,126 @@ def giou_loss(pred_boxes: torch.Tensor, gt_boxes: torch.Tensor) -> torch.Tensor:
 
 
 #compute both, cross entropy is just libary
+def canonical_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+    """
+    Ensure [xmin, xmax, ymin, ymax] ordering.
+    Prediction head uses sigmoid but does not guarantee xmin <= xmax or ymin <= ymax.
+    """
+    xmin = torch.minimum(boxes[..., 0], boxes[..., 1])
+    xmax = torch.maximum(boxes[..., 0], boxes[..., 1])
+    ymin = torch.minimum(boxes[..., 2], boxes[..., 3])
+    ymax = torch.maximum(boxes[..., 2], boxes[..., 3])
+    return torch.stack([xmin, xmax, ymin, ymax], dim=-1)
+
+
+#compute both, cross entropy is just libary
 def compute_loss(
     pred_boxes:   torch.Tensor,   # [B, num_queries, 4]  
-    pred_classes: torch.Tensor,   # [B, num_queries, num_classes]  
+    pred_classes: torch.Tensor,   # [B, num_queries, num_classes + 1]  
     gt_boxes:     torch.Tensor,   # [B, T, 4]  
     gt_classes:   torch.Tensor,   # [B, T]  
     cfg_loss:     dict,
 ) -> tuple[torch.Tensor, dict]:
-    
+
     B, num_queries, num_classes = pred_classes.shape
-    
+    no_object_class = num_classes - 1
+    pred_boxes = canonical_xyxy(pred_boxes)
+
     # Get weights
-    w_l1   = cfg_loss.get("bbox_l1_weight",   5.0)
-    w_giou = cfg_loss.get("bbox_giou_weight", 2.0)
-    w_cls  = cfg_loss.get("class_weight",     1.0)
+    w_l1    = cfg_loss.get("bbox_l1_weight",   5.0)
+    w_giou  = cfg_loss.get("bbox_giou_weight", 2.0)
+    w_cls   = cfg_loss.get("class_weight",     1.0)
+    w_noobj = cfg_loss.get("no_object_weight", 0.1)
 
     # Probabilities for class matching cost
     probs = torch.softmax(pred_classes, dim=-1)
+
+    ce_weight = pred_classes.new_ones(num_classes)
+    ce_weight[no_object_class] = w_noobj
 
     total_l1   = pred_boxes.new_tensor(0.0)
     total_giou = pred_boxes.new_tensor(0.0)
     total_cls  = pred_boxes.new_tensor(0.0)
     valid_frames = 0
-
-    # ── Phase 1: build all cost matrices on GPU, transfer the whole batch at once ──
-    # Each sample may have a different number of valid GT boxes, so we can't stack
-    # into one tensor. Instead we collect the GPU tensors, do a single .cpu() call
-    # per sample but defer it until we've built all of them — this keeps the GPU
-    # busy computing the next sample's cost while the PCIe transfer for the previous
-    # one is in flight, rather than stalling after every individual sample.
-    valid_masks   = [gt_classes[b] != -1 for b in range(B)]
-    valid_gt_boxes_list   = [gt_boxes[b][valid_masks[b]]   for b in range(B)]
-    valid_gt_classes_list = [gt_classes[b][valid_masks[b]] for b in range(B)]
-
-    # Build every cost matrix on GPU first, then batch-transfer to CPU.
-    cost_matrices_gpu = []
-
-    # calc time to see if it is bottleneck, could be rm if not needed
-    start_time = time.perf_counter()
+    total_queries = 0
 
     for b in range(B):
-        num_gt = valid_gt_boxes_list[b].shape[0]
-        if num_gt == 0:
-            cost_matrices_gpu.append(None)
-            continue
+        valid_mask = gt_classes[b] != -1
+        valid_gt_boxes = gt_boxes[b][valid_mask]
+        valid_gt_classes = gt_classes[b][valid_mask].long()
 
-        out_prob   = probs[b]                                          # [Q, C]
-        cost_class = -out_prob[:, valid_gt_classes_list[b]]            # [Q, num_gt]
-        cost_l1    = torch.cdist(pred_boxes[b], valid_gt_boxes_list[b], p=1)  # [Q, num_gt]
-        cost_giou  = giou_loss(
-            pred_boxes[b].unsqueeze(1),
-            valid_gt_boxes_list[b].unsqueeze(0),
-        )                                                              # [Q, num_gt]
+        # Default: every unmatched query is supervised as background/no-object.
+        target_classes = torch.full(
+            (num_queries,),
+            fill_value=no_object_class,
+            dtype=torch.long,
+            device=pred_classes.device,
+        )
 
-        C = (w_cls * cost_class) + (w_l1 * cost_l1) + (w_giou * cost_giou)
-        cost_matrices_gpu.append(C)
+        num_gt = valid_gt_boxes.shape[0]
+        if num_gt > 0:
+            out_prob   = probs[b][:, :no_object_class]                       # [Q, object classes only]
+            cost_class = -out_prob[:, valid_gt_classes]                      # [Q, num_gt]
+            cost_l1    = torch.cdist(pred_boxes[b], valid_gt_boxes, p=1)     # [Q, num_gt]
+            cost_giou  = giou_loss(
+                pred_boxes[b].unsqueeze(1),
+                valid_gt_boxes.unsqueeze(0),
+            )                                                               # [Q, num_gt]
 
-    # ── Phase 2: Hungarian matching directly on GPU ──
-    for b in range(B):
-        C = cost_matrices_gpu[b]
-        if C is None:
-            continue
+            C = (w_cls * cost_class) + (w_l1 * cost_l1) + (w_giou * cost_giou)
 
-        # C is already on the GPU [Q, num_gt]. 
-        # gpu_lsa returns torch tensors on the same device.
-        row_ind, col_ind = gpu_lsa(C)
+            # C is already on the GPU [Q, num_gt]. 
+            # gpu_lsa returns torch tensors on the same device.
+            row_ind, col_ind = gpu_lsa(C)
 
-        # Cast to long explicitly just to be safe for indexing
-        row_t = row_ind.to(dtype=torch.long)
-        col_t = col_ind.to(dtype=torch.long)
+            # Cast to long explicitly just to be safe for indexing
+            row_t = row_ind.to(dtype=torch.long)
+            col_t = col_ind.to(dtype=torch.long)
 
-        matched_boxes    = pred_boxes[b][row_t]
-        matched_logits   = pred_classes[b][row_t]
-        matched_gt_boxes = valid_gt_boxes_list[b][col_t]
-        matched_gt_cls   = valid_gt_classes_list[b][col_t]
+            matched_boxes    = pred_boxes[b][row_t]
+            matched_gt_boxes = valid_gt_boxes[col_t]
+            matched_gt_cls   = valid_gt_classes[col_t]
 
-        M = row_t.shape[0]
-        total_l1   += F.l1_loss(matched_boxes, matched_gt_boxes)
-        total_giou += giou_loss(matched_boxes, matched_gt_boxes).mean()
-        total_cls  += F.cross_entropy(matched_logits, matched_gt_cls)
-        valid_frames += M
+            M = row_t.shape[0]
+            if M > 0:
+                target_classes[row_t] = matched_gt_cls
+                total_l1   += F.l1_loss(matched_boxes, matched_gt_boxes, reduction="sum") / 4.0
+                total_giou += giou_loss(matched_boxes, matched_gt_boxes).sum()
+                valid_frames += M
+
+        # Classification is computed for all queries, including no-object queries.
+        total_cls += F.cross_entropy(
+            pred_classes[b],
+            target_classes,
+            weight=ce_weight,
+            reduction="sum",
+        )
+        total_queries += num_queries
 
     # Safe return if the entire batch happens to be empty clips
-    if valid_frames == 0:
+    if total_queries == 0:
         zero = (pred_boxes * 0).sum() + (pred_classes * 0).sum()
         return zero, {
             "loss_total": 0.0, "loss_cls": 0.0, "loss_l1": 0.0, "loss_giou": 0.0
         }
 
-    # Average over valid frames
-    total_l1   = total_l1   / valid_frames
-    total_giou = total_giou / valid_frames
-    total_cls  = total_cls  / valid_frames
+    # Average over valid frames / all queries
+    if valid_frames > 0:
+        total_l1   = total_l1   / valid_frames
+        total_giou = total_giou / valid_frames
+    else:
+        total_l1   = (pred_boxes * 0).sum()
+        total_giou = (pred_boxes * 0).sum()
+
+    total_cls = total_cls / total_queries
 
     total = (w_cls * total_cls) + (w_l1 * total_l1) + (w_giou * total_giou)
 
-    end_time = time.perf_counter()
-    print(f"Cost computation time: {end_time - start_time:.4f} seconds")
-
     return total, {
-        "loss_total": total.item(),
-        "loss_cls":   (w_cls * total_cls).item(),
-        "loss_l1":    (w_l1 * total_l1).item(),
-        "loss_giou":  (w_giou * total_giou).item(),
+        "loss_total": total.detach().item(),
+        "loss_cls":   (w_cls * total_cls).detach().item(),
+        "loss_l1":    (w_l1 * total_l1).detach().item(),
+        "loss_giou":  (w_giou * total_giou).detach().item(),
     }
 
 
@@ -216,16 +232,11 @@ def train_one_epoch(
         gt_classes = batch["true_class"].to(device, non_blocking=True)  # [B, T]
         mv         = batch.get("motion_vectors")
         res        = batch.get("residuals")
-        frame_types = batch["frame_types"]            # list[list[str]], shape [B][T]
+        iframe_mask = batch["iframe_mask"].to(device, non_blocking=True)  # [B, T]
 
         # as we want to experiment, test with one of them
         if mv  is not None: mv  = mv.to(device, non_blocking=True)
         if res is not None: res = res.to(device, non_blocking=True)
-
-        # frame_types for the model: it expects a flat list of length T (one per frame).
-        # All clips in a batch share the same frame-type sequence (same clip_length),
-        # so we take the first clip's types.
-        ft_sequence = frame_types[0]  # list[str] length T
 
         # forward calculation
         # set_to_none=True drops gradient references instead of zeroing buffers —
@@ -233,7 +244,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            pred_boxes, pred_classes = model(mv, res, ft_sequence)
+            pred_boxes, pred_classes = model(mv, res, iframe_mask)
             loss, parts = compute_loss(pred_boxes, pred_classes, gt_boxes, gt_classes, cfg_loss)
 
         if loss.requires_grad:
@@ -305,13 +316,13 @@ def validate(
         gt_classes = batch["true_class"].to(device, non_blocking=True)
         mv = batch.get("motion_vectors")
         res = batch.get("residuals")
-        ft_sequence = batch["frame_types"][0]
+        iframe_mask = batch["iframe_mask"].to(device, non_blocking=True)
         
         if mv is not None: mv = mv.to(device, non_blocking=True)
         if res is not None: res = res.to(device, non_blocking=True)
 
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            pred_boxes, pred_logits = model(mv, res, ft_sequence)
+            pred_boxes, pred_logits = model(mv, res, iframe_mask)
             loss, parts = compute_loss(pred_boxes, pred_logits, gt_boxes, gt_classes, cfg_loss)
 
         # Accumulate losses
@@ -321,7 +332,8 @@ def validate(
 
         # Prepare data for eval_framework.evaluate
         B, Q, _ = pred_boxes.shape
-        probs = torch.softmax(pred_logits, dim=-1)
+        # Last class is background/no-object. Do not evaluate it as a real class.
+        probs = torch.softmax(pred_logits, dim=-1)[..., :num_classes]
 
         # Sort box coords so xmin<=xmax and ymin<=ymax.
         # The bbox MLP+sigmoid gives values in [0,1] but with no ordering guarantee.
@@ -491,7 +503,7 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
 
     # debug to se gpu metrics different way
     pynvml.nvmlInit()
-    physical_gpu_id = int(gpu_id.split(",")[0])
+    physical_gpu_id = int(gpu_id.split(",")[0]) if gpu_id.strip() else 0
     gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(physical_gpu_id)
 
     # Load config
@@ -572,6 +584,7 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
         num_heads          = cfg_model.get("num_heads", 8),
         num_encoder_layers = cfg_model.get("num_encoder_layers", 4),
         num_decoder_layers = cfg_model.get("num_decoder_layers", 4),
+        num_queries        = cfg_model.get("num_queries", 10),
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -588,21 +601,29 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
     # CUDA DMA engine can transfer them to the GPU without a CPU copy,
     # which significantly reduces the time the GPU sits idle waiting for data.
     train_loader, val_loader, test_loader = build_data_loaders(
-            npz_dir=cfg["data"]["npz_dir"],
-            clip_length=cfg["data"]["clip_length"],
-            stride=cfg["data"]["stride"],
-            snap_to_iframe=cfg["data"]["snap_to_iframe"],
-            max_files=cfg["data"].get("max_files"),
+            npz_dir=cfg_data["npz_dir"],
+            clip_length=cfg_data["clip_length"],
+            stride=cfg_data["stride"],
+            snap_to_iframe=cfg_data["snap_to_iframe"],
+            max_files=cfg_data.get("max_files"),
             batch_size=cfg_train["batch_size"],
             num_workers=cfg_train.get("num_workers", 4),
             pin_memory=(device.type == "cuda"),
-            target_classes=cfg["data"].get("target_classes", []),
+            target_classes=cfg_data.get("target_classes", []),
+            use_motionvectors=cfg_data.get("use_motionvectors", True),
+            use_residuals=cfg_data.get("use_residuals", True),
+            train_ratio=cfg_data.get("train_ratio", 0.8),
+            val_ratio=cfg_data.get("val_ratio", 0.1),
+            test_ratio=cfg_data.get("test_ratio", 0.1),
+            prefetch_factor=cfg_train.get("prefetch_factor", 2),
+            persistent_workers=cfg_train.get("persistent_workers", True),
         )
 
     # debug
-    batch = next(iter(train_loader))
-    print({k: v.shape if isinstance(v, torch.Tensor) else "list"
-       for k, v in batch.items()})
+    if cfg_train.get("debug_first_batch", False):
+        batch = next(iter(train_loader))
+        print({k: v.shape if isinstance(v, torch.Tensor) else "list"
+           for k, v in batch.items()})
     
     # Safely get sizes even if val/test are empty lists
     val_size = len(val_loader.dataset) if hasattr(val_loader, 'dataset') else 0
@@ -624,13 +645,27 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
     sched_type    = cfg_train.get("scheduler", "cosine")
 
     if sched_type == "cosine":
-        main_sched = CosineAnnealingLR(
-            optimizer, T_max=max(1, epochs - warmup_epochs)
-        )
+        if warmup_epochs > 0:
+            warmup_sched = LinearLR(
+                optimizer,
+                start_factor=1e-3,
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            )
+            cosine_sched = CosineAnnealingLR(
+                optimizer, T_max=max(1, epochs - warmup_epochs)
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_sched, cosine_sched],
+                milestones=[warmup_epochs],
+            )
+        else:
+            scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs))
+    elif sched_type == "plateau":
+        scheduler = ReduceLROnPlateau(optimizer, mode="min", patience=3)
     else:
-        main_sched = ReduceLROnPlateau(optimizer, mode="min", patience=3)
-
-    scheduler = make_warmup_scheduler(optimizer, warmup_epochs, main_sched)
+        raise ValueError(f"Unknown scheduler type: {sched_type}")
 
     # Checkpoint dir & config snapshot 
     ckpt_dir = os.path.join(cfg_paths.get("checkpoint_dir", "checkpoints"), exp_name)
@@ -668,7 +703,7 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
 
         # Step scheduler (warm-up + cosine are both stepped per epoch)
         if sched_type == "plateau":
-            main_sched.step(val_losses["loss_total"])
+            scheduler.step(val_losses["loss_total"])
         else:
             scheduler.step()
 
@@ -710,8 +745,6 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
             "my_gpu/memory_total_MB": mem_info.total // (1024 ** 2),
             "my_gpu/utilization_percent": util_info.gpu
         })
-
-        mlflow.log_metrics(metrics_to_log, step=epoch)
 
         mlflow.log_metrics(metrics_to_log, step=epoch)
         

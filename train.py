@@ -607,6 +607,7 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
             stride=cfg_data["stride"],
             snap_to_iframe=cfg_data["snap_to_iframe"],
             max_files=cfg_data.get("max_files"),
+            max_files_per_class=cfg_data.get("max_files_per_class"),
             batch_size=cfg_train["batch_size"],
             num_workers=cfg_train.get("num_workers", 4),
             pin_memory=(device.type == "cuda"),

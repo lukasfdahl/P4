@@ -4,8 +4,8 @@
 # train.py loads this file and logs its full contents to the run directory
 # so every checkpoint is reproducible.
 
-experiment_name: "test_100_videos_from_1500"
-run_name:        "run01_100videos_3class"
+experiment_name: "baseline_5class_300ep"
+run_name:        "run01_5class_baseline"
 
 
 # Resume training from a checkpoint.
@@ -45,29 +45,31 @@ data:
   train_ratio:      0.7
   val_ratio:        0.3
   test_ratio:       0.0
-  max_files:        100
+  max_files:        null           # set to null to use max_files_per_class instead
+  max_files_per_class: 500         # cap per class — null for all videos
 
   # Class filter — only windows containing at least one of these classes are loaded.
-  target_classes:   [1, 2, 3]
+  # YouTube-BB IDs (1-based): 1=person, 2=bird, 6=bear, 9=dog, 11=motorcycle
+  target_classes:   [1, 2, 6, 9, 11]
 
 # Training loop
 training:
-  epochs:        50
+  epochs:        300
   batch_size:    256
   seed:          42
   num_workers:   6
   prefetch_factor: 4
   persistent_workers: true
   debug_first_batch: false
-  lr:            3.0e-4
-  weight_decay:  0
+  lr:            4.0e-4        # scaled from DETR 1e-4 @ batch64 → batch256
+  weight_decay:  1e-4
   grad_clip:     1.0           # max gradient norm — important for transformer stability
 
   # Learning-rate scheduler
   # "cosine" → CosineAnnealingLR over all epochs
   # "plateau" → ReduceLROnPlateau (monitors val loss)
   scheduler:     "cosine"
-  warmup_epochs: 2             # linear LR warm-up before the main scheduler kicks in
+  warmup_epochs: 10            # longer warmup for stability at higher lr
 
 # Loss function
 # bbox loss = l1_weight * L1  +  giou_weight * GIoU

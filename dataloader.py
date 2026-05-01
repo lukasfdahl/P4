@@ -471,6 +471,7 @@ def build_data_loaders(
     snap_to_iframe: bool = True,
     limit_1_video:  bool = False,
     max_files:      int | None = None,
+    max_files_per_class: int | None = None,
     batch_size:     int = BATCH_SIZE,
     num_workers:    int = NUM_WORKERS,
     pin_memory:     bool = False,
@@ -529,6 +530,26 @@ def build_data_loaders(
 
         if limit_1_video:
             sources = sources[:1]
+
+        # Per-class cap — scan metadata and keep at most max_files_per_class
+        # videos per target class. Videos containing multiple target classes
+        # count toward each class they belong to.
+        if max_files_per_class is not None and target_classes is not None:
+            target_set_0 = {c - 1 for c in target_classes}  # convert to 0-based
+            class_counts: dict[int, int] = {c: 0 for c in target_set_0}
+            filtered_sources = []
+            for path in sources:
+                data = _open_video_source(path, mmap_mode="r")
+                cls_arr = data["true_class"]
+                video_classes = set(cls_arr[cls_arr != -1].tolist()) & target_set_0
+                if any(class_counts.get(c, 0) < max_files_per_class for c in video_classes):
+                    filtered_sources.append(path)
+                    for c in video_classes:
+                        class_counts[c] = class_counts.get(c, 0) + 1
+            sources = filtered_sources
+            readable = {c + 1: n for c, n in class_counts.items()}
+            print(f"[DataLoader] Per-class cap {max_files_per_class}: {readable}  "
+                  f"({len(sources)} videos total)")
 
         source_data  = sources
         window_index = lazy_build_window_index(

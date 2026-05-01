@@ -334,7 +334,7 @@ class TransformerCore(nn.Module):
                 self.temporal_pos._cache[t] = self.temporal_pos._build(t, all_tokens.device)
             temp_encs.append(self.temporal_pos._cache[t])  # each [1, 1, D]
         # [1, T, 1, D]
-        temp_enc = torch.cat(temp_encs, dim=1).to(dtype=all_tokens.dtype)
+        temp_enc = torch.cat(temp_encs, dim=1).unsqueeze(2).to(dtype=all_tokens.dtype)
         all_tokens = all_tokens + temp_enc  # broadcasts over B and S
 
         # Flatten to [B, T*S, D] for the encoder
@@ -433,6 +433,7 @@ class ObjectDetector(nn.Module):
         num_encoder_layers: int = 4,
         num_decoder_layers: int = 4,
         ffn_dim: int | None = None,
+        num_queries: int = 10,
     ):
         super().__init__()  
 
@@ -449,9 +450,9 @@ class ObjectDetector(nn.Module):
         self.finest_scale = min(scales)   # token grid resolution used by the transformer
         self.clip_length  = clip_length
 
-        # num_queries scales with the number of tokens so the decoder is neither
-        # starved (fewer queries than tokens) nor massively over-provisioned.
-        num_queries = 10 # fixed
+        # num_queries is configurable. With the current dataset export, one video
+        # frame has at most one object target, so 10 queries is a small default.
+        self.num_queries = num_queries
 
         # now with multiscale
         self.tokenizer = MultiScaleH264Tokenizer(
@@ -468,12 +469,16 @@ class ObjectDetector(nn.Module):
             num_encoder_layers=num_encoder_layers,
             num_decoder_layers=num_decoder_layers,
             ffn_dim=ffn_dim,
-            num_queries=num_queries,
+            num_queries=self.num_queries,
         )
+
+        self.num_object_classes = num_classes
+        self.no_object_class = num_classes
+        self.num_output_classes = num_classes + 1
 
         self.prediction_heads = PredictionHeads(
             hidden_dim=hidden_dim,
-            num_classes=num_classes,
+            num_classes=self.num_output_classes,
             bbox_head_dim=hidden_dim,
             class_head_dim=hidden_dim,
             bbox_num_layers=3,
@@ -484,7 +489,7 @@ class ObjectDetector(nn.Module):
         self,
         motion_vectors: torch.Tensor,  # [B, T, 4, H_tokens, W_tokens]
         residuals: torch.Tensor,       # [B, T, 3, H, W]
-        frame_types: list[str],        # length T, e.g. ['I', 'P', 'P', 'B', 'P']
+        iframe_mask: torch.Tensor,     # [B, T] bool, True where the frame is an I-frame
     ):
         B, T = motion_vectors.shape[:2]
         H, W = residuals.shape[3], residuals.shape[4]
@@ -493,18 +498,15 @@ class ObjectDetector(nn.Module):
 
         # Fold T into batch so the tokenizer runs ONE forward pass instead of T.
         # [B, T, C, H, W] -> [B*T, C, H, W]
-        mv_flat  = motion_vectors.view(B * T, *motion_vectors.shape[2:])
-        res_flat = residuals.view(B * T, *residuals.shape[2:])
+        mv_flat  = motion_vectors.reshape(B * T, *motion_vectors.shape[2:])
+        res_flat = residuals.reshape(B * T, *residuals.shape[2:])
 
         # Zero I-frame MVs in one vectorised mask instead of a per-frame branch.
-        # Build a [B*T] bool mask: True where the frame is an I-frame.
-        iframe_mask = torch.tensor(
-            [ft == 'I' for ft in frame_types],  # [T] — same sequence for every clip
-            device=mv_flat.device,
-        ).repeat_interleave(B)  # broadcast over batch: [B*T]
+        # Flatten order matches mv_flat/res_flat: [b0t0, b0t1, ..., b1t0, b1t1, ...].
+        iframe_mask_flat = iframe_mask.to(device=mv_flat.device, dtype=torch.bool).reshape(B * T)
         # Reshape for broadcasting against [B*T, 4, H_mv, W_mv]
         mv_flat = mv_flat.clone()   # avoid in-place on a view
-        mv_flat[iframe_mask] = 0.0
+        mv_flat[iframe_mask_flat] = 0.0
 
         # Single tokenizer forward: [B*T, S, D]  where S = h_tokens * w_tokens
         all_tokens = self.tokenizer(mv_flat, res_flat, is_iframe=False)
@@ -519,15 +521,15 @@ class ObjectDetector(nn.Module):
         return final_boxes, final_classes
 
 
-# Wrapper for torchinfo summary (hides frame_types from the signature)
+# Wrapper for torchinfo summary (hides iframe_mask from the signature)
 class WrappedModel(nn.Module):
-    def __init__(self, model, frame_types):
+    def __init__(self, model, iframe_mask):
         super().__init__()
         self.model = model
-        self.frame_types = frame_types
+        self.iframe_mask = iframe_mask
 
     def forward(self, motion_vectors, residuals):
-        return self.model(motion_vectors, residuals, self.frame_types)
+        return self.model(motion_vectors, residuals, self.iframe_mask)
 
 # helper for dummy data — generates a full clip of frames
 def _generate_dummy_data(
@@ -548,7 +550,8 @@ def _generate_dummy_data(
 
     # Realistic frame type sequence: first frame is always I, rest are P/B
     frame_types = ['I'] + ['P'] * (clip_length - 1)
-    return motion_vectors, residuals, frame_types
+    iframe_mask = torch.tensor([[ft == 'I' for ft in frame_types]] * batch_size, dtype=torch.bool)
+    return motion_vectors, residuals, iframe_mask
 
 
 if __name__ == "__main__":
@@ -568,14 +571,14 @@ if __name__ == "__main__":
     )
     
     # generate dummy data for testing
-    motion_vectors, residuals, frame_types = _generate_dummy_data(
+    motion_vectors, residuals, iframe_mask = _generate_dummy_data(
         batch_size  = 4,
         clip_length = CLIP_LENGTH,
         frame_h     = FRAME_H,
         frame_w     = FRAME_W,
     )
 
-    wrapped_model = WrappedModel(model, frame_types)
+    wrapped_model = WrappedModel(model, iframe_mask)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     wrapped_model.to(device)
@@ -591,11 +594,11 @@ if __name__ == "__main__":
 
     print(f"Input motion_vectors: {motion_vectors.shape}")  # [4, 5, 4, 4, 4]
     print(f"Input residuals:      {residuals.shape}")       # [4, 5, 3, 64, 64]
-    print(f"Frame types:          {frame_types}")
+    print(f"I-frame mask:         {iframe_mask}")
 
-    boxes, classes = model(motion_vectors, residuals, frame_types)
+    boxes, classes = model(motion_vectors, residuals, iframe_mask.to(device))
     print(f"\nOutput boxes:   {boxes.shape}")    # [4, 80, 4]
-    print(f"Output classes: {classes.shape}")   # [4, 80, 10]
+    print(f"Output classes: {classes.shape}")   # [4, num_queries, num_classes + 1]
 
     # Check if the output is on the same device as the model
     print(f"Output boxes device: {boxes.device}")

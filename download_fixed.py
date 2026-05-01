@@ -29,7 +29,7 @@ import cv_reader
 # CONFIG
 CONFIG = {
     "MODE":            "DOWNLOAD",     # "CHECK" or "DOWNLOAD"
-    "MAX_VIDEOS":      2000,             # Max number of videos to check/download
+    "MAX_VIDEOS":      4000,             # Max number of videos to check/download
     "MAX_WORKERS":     1,              # Number of parallel threads for downloading/checking
     "TARGET_CLASSES":  [],             # List of class IDs to download, e.g., [1, 23]. Leave empty [] for all.
     
@@ -52,9 +52,10 @@ CONFIG = {
     "COOKIES_FILE":    "my_cookies_.txt",
 
     "SEGMENT_PADDING": 1.0,            # seconds of extra context around annotation
-    "FRAME_H":         64,
-    "FRAME_W":         64,
+    "FRAME_H":         360,
+    "FRAME_W":         360,
     "FPS":             30,             # must match npz_importer.py
+    "SAVE_FORMAT":     "npy_dir",      # "npy_dir", "npz", or "npz_compressed"
 }
 
 # CSV schema
@@ -247,6 +248,71 @@ MV_STRUCT = np.dtype([
     ("motion_scale", np.int32),
 ])
 
+def _path_size_mb(path: str) -> float:
+    if os.path.isfile(path):
+        return os.path.getsize(path) / (1024 ** 2)
+
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            total += os.path.getsize(os.path.join(root, f))
+    return total / (1024 ** 2)
+
+
+def _save_video_arrays(
+    output_path: str,
+    frame_types: np.ndarray,
+    motion_vectors: np.ndarray,
+    residuals: np.ndarray,
+    boxes: np.ndarray,
+    true_class: np.ndarray,
+) -> None:
+    """
+    SAVE_FORMAT options:
+      "npy_dir"        -> fastest training, true memmap, one folder per video
+      "npz"            -> uncompressed .npz, bigger but faster than compressed
+      "npz_compressed" -> smallest, slowest for training
+    """
+    save_format = CONFIG.get("SAVE_FORMAT", "npy_dir")
+
+    frame_types    = np.asarray(frame_types)
+    motion_vectors = np.asarray(motion_vectors)
+    residuals      = np.asarray(residuals, dtype=np.uint8)
+    boxes          = np.asarray(boxes, dtype=np.float32)
+    true_class     = np.asarray(true_class, dtype=np.int32)
+
+    if save_format == "npy_dir":
+        os.makedirs(output_path, exist_ok=True)
+        np.save(os.path.join(output_path, "frame_types.npy"), frame_types)
+        np.save(os.path.join(output_path, "motion_vectors.npy"), motion_vectors)
+        np.save(os.path.join(output_path, "residuals.npy"), residuals)
+        np.save(os.path.join(output_path, "boxes.npy"), boxes)
+        np.save(os.path.join(output_path, "true_class.npy"), true_class)
+
+    elif save_format == "npz":
+        np.savez(
+            output_path,
+            frame_types=frame_types,
+            motion_vectors=motion_vectors,
+            residuals=residuals,
+            boxes=boxes,
+            true_class=true_class,
+        )
+
+    elif save_format == "npz_compressed":
+        np.savez_compressed(
+            output_path,
+            frame_types=frame_types,
+            motion_vectors=motion_vectors,
+            residuals=residuals,
+            boxes=boxes,
+            true_class=true_class,
+        )
+
+    else:
+        raise ValueError(f"Unknown SAVE_FORMAT: {save_format}")
+
+
 def _extract_to_npz(video_path: str, output_npz: str, frame_h: int, frame_w: int, df, vid_id: str, chunk_start_time: float) -> bool:
     try:
         # 1. Read directly from the custom C++ library bitstream
@@ -286,16 +352,6 @@ def _extract_to_npz(video_path: str, output_npz: str, frame_h: int, frame_w: int
                 matched_boxes_array[i] = [row["xmin"], row["xmax"], row["ymin"], row["ymax"]]
                 matched_class_array[i] = int(row["class_id"]) - 1   # shift to 0-based
 
-        # Interpolate the gaps between annotations (up to 90 frames / 3 seconds)
-        df_boxes = pd.DataFrame(matched_boxes_array).replace(0, np.nan)
-        df_boxes = df_boxes.interpolate(method='linear', limit=90, limit_area='inside')
-        matched_boxes_array = df_boxes.fillna(0).values
-
-        # Forward/Backward fill the class IDs across the same gaps
-        df_classes = pd.Series(matched_class_array).replace(-1, np.nan)
-        df_classes = df_classes.ffill(limit=90).bfill(limit=90)
-        matched_class_array = df_classes.fillna(-1).values
-
         # Linear interpolation of bounding boxes across unannotated frames.
         # interpolate spatially between known anchor points (max gap: 90 frames = 3s)
         interp_df = pd.DataFrame({
@@ -313,24 +369,27 @@ def _extract_to_npz(video_path: str, output_npz: str, frame_h: int, frame_w: int
         # Interpolate box coords linearly (limit=90 frames = 3 s max gap)
         interp_df[["xmin", "xmax", "ymin", "ymax"]] = (
             interp_df[["xmin", "xmax", "ymin", "ymax"]]
-            .interpolate(method="linear", limit=90, limit_direction="forward")
+            .interpolate(method="linear", limit=90, limit_area="inside")
         )
 
-        # Forward-fill class IDs only (never interpolate categorically)
-        interp_df["cls"] = interp_df["cls"].ffill()
+        # Forward-fill class IDs only (never interpolate categorically).
+        # Keep class=-1 anywhere box interpolation did not produce a valid box.
+        valid_box_mask = interp_df[["xmin", "xmax", "ymin", "ymax"]].notna().all(axis=1)
+        interp_df["cls"] = interp_df["cls"].ffill(limit=90)
+        interp_df.loc[~valid_box_mask, "cls"] = np.nan
 
         # Convert back: any remaining NaN (padding before first annotation) → -1
         final_class_array = interp_df["cls"].fillna(-1).astype(np.int32).values
         final_boxes_array = interp_df[["xmin", "xmax", "ymin", "ymax"]].fillna(0.0).to_numpy(dtype=np.float32)
 
         # 5. Save
-        np.savez_compressed(
-            output_npz,
+        _save_video_arrays(
+            output_path    = output_npz,
             frame_types    = frame_types,
             motion_vectors = motion_vectors,
             residuals      = residuals,
-            boxes          = matched_boxes_array,    # Now these are interpolated!
-            true_class     = matched_class_array,    # Now these are filled!
+            boxes          = final_boxes_array,      # Now these are interpolated!
+            true_class     = final_class_array,      # Now these are filled!
         )
         return True
         
@@ -341,8 +400,12 @@ def _extract_to_npz(video_path: str, output_npz: str, frame_h: int, frame_w: int
 
 # Parallel Download Pipeline
 def _worker_download_and_extract(vid_id, chunks, tmp_dir, output_dir, frame_h, frame_w, df):
-    out_npz = os.path.join(output_dir, f"{vid_id}.npz")
-    
+    save_format = CONFIG.get("SAVE_FORMAT", "npy_dir")
+    if save_format == "npy_dir":
+        out_npz = os.path.join(output_dir, vid_id)
+    else:
+        out_npz = os.path.join(output_dir, f"{vid_id}.npz")
+
     if os.path.exists(out_npz):
         return vid_id, "skipped"
 
@@ -369,8 +432,8 @@ def _worker_download_and_extract(vid_id, chunks, tmp_dir, output_dir, frame_h, f
         pass
 
     if success:
-        size_kb = os.path.getsize(out_npz) // 1024
-        return vid_id, f"success ({size_kb} KB)"
+        size_mb = _path_size_mb(out_npz)
+        return vid_id, f"success ({size_mb:.1f} MB)"
     else:
         return vid_id, "failed_extract"
 

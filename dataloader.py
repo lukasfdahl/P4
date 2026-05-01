@@ -8,6 +8,7 @@ __getitem__ returns:
     motion_vectors : [T, 4, H_tokens, W_tokens]   (float32)   – if USE_MOTIONVECTORS
     residuals      : [T, 3, H, W]                  (float32, normalised to [0,1])  – if USE_RESIDUALS
     frame_types    : list[str]  length T
+    iframe_mask    : [T]       bool     True for I-frames
     boxes          : [T, 4]    float32  [xmin, xmax] per frame
     true_class     : [T]       int64    class label per frame
  
@@ -15,7 +16,8 @@ collate_fn batches those into:
     motion_vectors : [B, T, 4, H_tokens, W_tokens]  – if USE_MOTIONVECTORS
     residuals      : [B, T, 3, H, W]                – if USE_RESIDUALS
     frame_types    : list[list[str]]  shape [B][T]   (can't stack strings)
-    boxes          : [B, T, 2]
+    iframe_mask    : [B, T]
+    boxes          : [B, T, 4]
     true_class     : [B, T]
 """
 
@@ -66,6 +68,49 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
+def _is_npy_video_dir(path: str) -> bool:
+    required = [
+        "frame_types.npy",
+        "motion_vectors.npy",
+        "residuals.npy",
+        "boxes.npy",
+        "true_class.npy",
+    ]
+    return os.path.isdir(path) and all(
+        os.path.exists(os.path.join(path, name)) for name in required
+    )
+
+
+def _find_video_sources(data_dir: str) -> list[str]:
+    """
+    Supports both:
+      old: dataset/video_id.npz
+      new: dataset/video_id/{frame_types,motion_vectors,residuals,boxes,true_class}.npy
+    """
+    npz_files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
+
+    npy_dirs = sorted(
+        os.path.join(data_dir, name)
+        for name in os.listdir(data_dir)
+        if _is_npy_video_dir(os.path.join(data_dir, name))
+    )
+
+    return npy_dirs + npz_files
+
+
+def _open_video_source(path: str, mmap_mode: str = "r"):
+    if os.path.isdir(path):
+        return {
+            "frame_types":    np.load(os.path.join(path, "frame_types.npy"), mmap_mode=mmap_mode),
+            "motion_vectors": np.load(os.path.join(path, "motion_vectors.npy"), mmap_mode=mmap_mode),
+            "residuals":      np.load(os.path.join(path, "residuals.npy"), mmap_mode=mmap_mode),
+            "boxes":          np.load(os.path.join(path, "boxes.npy"), mmap_mode=mmap_mode),
+            "true_class":     np.load(os.path.join(path, "true_class.npy"), mmap_mode=mmap_mode),
+        }
+
+    return np.load(path, mmap_mode=mmap_mode)
+
+
 # loading helper, lazy because not all in ram haha
 def lazy_build_window_index(
     npz_files:      list[str],
@@ -96,7 +141,7 @@ def lazy_build_window_index(
         # mmap_mode="r" — OS only pages in the two metadata arrays we slice,
         # not the full residuals/motion_vectors arrays. Critical for big datasets
         # where loading every NPZ fully would OOM or take minutes at startup.
-        data        = np.load(file_path, mmap_mode="r")
+        data        = _open_video_source(file_path, mmap_mode="r")
         frame_types = data["frame_types"]
         true_class  = data["true_class"]   # int32, -1 = no annotation
 
@@ -207,12 +252,18 @@ class ClipDataset(Dataset):
         indices: list[int],
         clip_length: int,
         base_mv_scale: int = BASE_MV_SCALE,
+        use_motionvectors: bool = USE_MOTIONVECTORS,
+        use_residuals: bool = USE_RESIDUALS,
     ):
         self.source_data = source_data
         self.window_index = window_index
         self.indices = indices
         self.clip_length = clip_length
         self.base_mv_scale = base_mv_scale
+        self.use_motionvectors = use_motionvectors
+        self.use_residuals = use_residuals
+        if not self.use_motionvectors and not self.use_residuals:
+            raise ValueError("At least one of use_motionvectors or use_residuals must be True.")
         
         self.is_lazy = len(source_data) > 0 and isinstance(source_data[0], str)
         # LRU cache: keeps last 8 NPZ files open per worker (insertion-order dict)
@@ -234,14 +285,14 @@ class ClipDataset(Dataset):
         clip_idx, start = self.window_index[sample_idx]
 
         if self.is_lazy:
-            # Direct numpy slice from NPZ — no Frame/Clip construction.
-            # mmap_mode="r" means the OS only fetches the pages we slice,
-            # not the whole file. LRU cache keeps last 8 files open per worker.
+            # Direct numpy slice from NPZ / NPY-dir — no Frame/Clip construction.
+            # mmap_mode="r" means the OS only fetches the pages we slice when the
+            # backing arrays are .npy files. LRU cache keeps last 8 files open per worker.
             file_path = self.source_data[clip_idx]
             if file_path not in self._npz_cache:
                 if len(self._npz_cache) >= self._cache_size:
                     self._npz_cache.pop(next(iter(self._npz_cache)))
-                self._npz_cache[file_path] = np.load(file_path, mmap_mode="r")
+                self._npz_cache[file_path] = _open_video_source(file_path, mmap_mode="r")
             npz = self._npz_cache[file_path]
 
             sl       = slice(start, start + self.clip_length)
@@ -251,61 +302,58 @@ class ClipDataset(Dataset):
             raw_box  = npz["boxes"][sl]             # [T, 4] float32
             raw_ft   = npz["frame_types"][sl]       # [T] str
 
-            for t in range(self.clip_length):
-                if USE_MOTIONVECTORS:
-                    mv_raw = raw_mv[t]
+            frame_types = [str(ft) for ft in raw_ft.tolist()]
+            iframe_mask = torch.tensor([ft == "I" for ft in frame_types], dtype=torch.bool)
 
-                    # NPZ stores MVs as plain int32 — must reinterpret as structured
-                    # dtype before accessing named fields (source, motion_x, etc.)
-                    mv = mv_raw.view(MV_STRUCT)
+            if self.use_motionvectors:
+                # NPZ/NPY stores MVs as plain int32 or structured arrays — reinterpret
+                # as structured dtype before accessing named fields (source, motion_x, etc.)
+                mv = raw_mv.view(MV_STRUCT)
 
-                    # Squeeze trailing singleton dimension if present → [H, W]
-                    if mv.ndim == 3 and mv.shape[-1] == 1:
-                        mv = mv[..., 0]
-                    elif mv.ndim == 1:
-                        s  = int(round(len(mv) ** 0.5))
-                        mv = mv.reshape(s, s)
+                # Squeeze trailing singleton dimension if present → [T, H, W]
+                if mv.ndim == 4 and mv.shape[-1] == 1:
+                    mv = mv[..., 0]
+                elif mv.ndim == 2:
+                    s  = int(round(mv.shape[1] ** 0.5))
+                    mv = mv.reshape(mv.shape[0], s, s)
 
-                    # mv is now [H, W] structured → stack fields → [4, H, W]
-                    mv_grid = np.stack([
-                        mv['source'].astype(np.float32),
-                        mv['motion_x'].astype(np.float32),
-                        mv['motion_y'].astype(np.float32),
-                        mv['motion_scale'].astype(np.float32),
-                    ], axis=0)   # [4, H, W]
+                # mv is now [T, H, W] structured → stack fields → [T, 4, H, W]
+                mv_grid = np.stack([
+                    mv['source'].astype(np.float32, copy=False),
+                    mv['motion_x'].astype(np.float32, copy=False),
+                    mv['motion_y'].astype(np.float32, copy=False),
+                    mv['motion_scale'].astype(np.float32, copy=False),
+                ], axis=1)   # [T, 4, H, W]
 
-                    # Resize with pure numpy (nearest-neighbour) — avoids spawning a
-                    # torch dispatch in each worker process. Only resize if needed.
-                    src_h, src_w = mv_grid.shape[1], mv_grid.shape[2]
-                    if src_h != H_TOKENS or src_w != W_TOKENS:
-                        row_idx = (np.arange(H_TOKENS) * src_h // H_TOKENS)
-                        col_idx = (np.arange(W_TOKENS) * src_w // W_TOKENS)
-                        mv_grid = mv_grid[:, row_idx[:, None], col_idx[None, :]]  # [4, H_TOKENS, W_TOKENS]
+                # Resize with pure numpy (nearest-neighbour) — avoids spawning a
+                # torch dispatch in each worker process. Only resize if needed.
+                src_h, src_w = mv_grid.shape[2], mv_grid.shape[3]
+                if src_h != H_TOKENS or src_w != W_TOKENS:
+                    row_idx = (np.arange(H_TOKENS) * src_h // H_TOKENS)
+                    col_idx = (np.arange(W_TOKENS) * src_w // W_TOKENS)
+                    mv_grid = mv_grid[:, :, row_idx[:, None], col_idx[None, :]]  # [T, 4, H_TOKENS, W_TOKENS]
 
-                    mv_list.append(torch.from_numpy(mv_grid))
+                mv_tensor = torch.from_numpy(np.ascontiguousarray(mv_grid))
 
-                if USE_RESIDUALS:
-                    # raw_res[t] is uint8 [H, W, 3]; normalise in numpy (no copy if
-                    # already float32 source), then permute to [3, H, W] via reshape.
-                    frame = raw_res[t]   # [H, W, 3] uint8
-                    src_h, src_w = frame.shape[0], frame.shape[1]
+            if self.use_residuals:
+                # raw_res is uint8 [T, H, W, 3]; normalise in numpy, then permute to [T, 3, H, W].
+                frames = raw_res
+                src_h, src_w = frames.shape[1], frames.shape[2]
 
-                    # Resize with pure numpy (bilinear approximated as nearest in worker;
-                    # 64×64 frames make the quality difference negligible, and it avoids
-                    # torch dispatch overhead in every worker).
-                    if src_h != FRAME_H or src_w != FRAME_W:
-                        row_idx = (np.arange(FRAME_H) * src_h // FRAME_H)
-                        col_idx = (np.arange(FRAME_W) * src_w // FRAME_W)
-                        frame = frame[row_idx[:, None], col_idx[None, :], :]  # [FRAME_H, FRAME_W, 3]
+                # Resize with pure numpy (bilinear approximated as nearest in worker;
+                # 64×64 frames make the quality difference negligible, and it avoids
+                # torch dispatch overhead in every worker).
+                if src_h != FRAME_H or src_w != FRAME_W:
+                    row_idx = (np.arange(FRAME_H) * src_h // FRAME_H)
+                    col_idx = (np.arange(FRAME_W) * src_w // FRAME_W)
+                    frames = frames[:, row_idx[:, None], col_idx[None, :], :]  # [T, FRAME_H, FRAME_W, 3]
 
-                    res = torch.from_numpy(
-                        np.ascontiguousarray(frame).astype(np.float32) / 255.0
-                    ).permute(2, 0, 1)   # [3, FRAME_H, FRAME_W]
-                    res_list.append(res)
+                res_tensor = torch.from_numpy(
+                    np.ascontiguousarray(frames.transpose(0, 3, 1, 2))
+                ).float().div_(255.0)   # [T, 3, FRAME_H, FRAME_W]
 
-                frame_types.append(str(raw_ft[t]))
-                boxes_list.append(torch.from_numpy(raw_box[t].astype(np.float32, copy=False)))
-                cls_list.append(torch.tensor(int(raw_cls[t]), dtype=torch.long))
+            boxes_tensor = torch.from_numpy(np.array(raw_box, dtype=np.float32, copy=True))  # [T, 4]
+            cls_tensor   = torch.from_numpy(np.array(raw_cls, dtype=np.int64, copy=True))    # [T]
 
         else:
             # Fallback for in-memory dummy Clip objects
@@ -313,7 +361,7 @@ class ClipDataset(Dataset):
             frames = clip.frames[start:start + self.clip_length]
 
             for frame in frames:
-                if USE_MOTIONVECTORS:
+                if self.use_motionvectors:
                     mv = frame.motion_vectors
 
                     if mv.ndim == 3 and mv.shape[-1] == 1:
@@ -334,7 +382,7 @@ class ClipDataset(Dataset):
                     ).squeeze(0)
                     mv_list.append(mv_tensor)
 
-                if USE_RESIDUALS:
+                if self.use_residuals:
                     res = torch.from_numpy(
                         frame.residuals.astype(np.float32) / 255.0
                     ).permute(2, 0, 1)
@@ -348,15 +396,24 @@ class ClipDataset(Dataset):
                 boxes_list.append(torch.tensor(frame.true_bounding_box, dtype=torch.float32))
                 cls_list.append(torch.tensor(frame.true_class, dtype=torch.long))
 
+            iframe_mask = torch.tensor([ft == "I" for ft in frame_types], dtype=torch.bool)
+            boxes_tensor = torch.stack(boxes_list)
+            cls_tensor = torch.stack(cls_list)
+            if self.use_motionvectors:
+                mv_tensor = torch.stack(mv_list)
+            if self.use_residuals:
+                res_tensor = torch.stack(res_list)
+
         sample = {
             "frame_types": frame_types,                      # list[str], length T
-            "boxes":       torch.stack(boxes_list),          # [T, 4]
-            "true_class":  torch.stack(cls_list),            # [T]
+            "iframe_mask": iframe_mask,                      # [T]
+            "boxes":       boxes_tensor,                     # [T, 4]
+            "true_class":  cls_tensor,                       # [T]
         }
-        if USE_MOTIONVECTORS:
-            sample["motion_vectors"] = torch.stack(mv_list)  # [T, 4, H_tokens, W_tokens]
-        if USE_RESIDUALS:
-            sample["residuals"]      = torch.stack(res_list) # [T, 3, H, W]
+        if self.use_motionvectors:
+            sample["motion_vectors"] = mv_tensor             # [T, 4, H_tokens, W_tokens]
+        if self.use_residuals:
+            sample["residuals"]      = res_tensor            # [T, 3, H, W]
 
         return sample
  
@@ -366,24 +423,37 @@ def collate_fn(batch: list[dict]) -> dict:
 
     collated = {
         "frame_types": [s["frame_types"] for s in batch],
-        "boxes":       torch.stack([s["boxes"]      for s in batch]),  # (B, T, 4)
-        "true_class":  torch.stack([s["true_class"] for s in batch]),  # (B, T)
+        "iframe_mask": torch.stack([s["iframe_mask"] for s in batch]),  # (B, T)
+        "boxes":       torch.stack([s["boxes"]      for s in batch]),   # (B, T, 4)
+        "true_class":  torch.stack([s["true_class"] for s in batch]),   # (B, T)
     }
-    if USE_MOTIONVECTORS:
+    if "motion_vectors" in batch[0]:
         collated["motion_vectors"] = torch.stack([s["motion_vectors"] for s in batch])
-    if USE_RESIDUALS:
+    if "residuals" in batch[0]:
         collated["residuals"]      = torch.stack([s["residuals"]      for s in batch])
 
     return collated
 
 
 # helper to create dataset splits
-def _make_video_splits(n_videos: int) -> dict[str, set[int]]:
+def _make_video_splits(
+    n_videos: int,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+) -> dict[str, set[int]]:
+    total = train_ratio + val_ratio + test_ratio
+    if total <= 0:
+        raise ValueError("train_ratio + val_ratio + test_ratio must be > 0")
+
+    train_ratio = train_ratio / total
+    val_ratio   = val_ratio / total
+
     video_ids = list(range(n_videos))
     random.shuffle(video_ids)
 
-    n_train = int(n_videos * TRAIN_RATIO)
-    n_val   = int(n_videos * VAL_RATIO)
+    n_train = int(n_videos * train_ratio)
+    n_val   = int(n_videos * val_ratio)
 
     return {
         "train": set(video_ids[:n_train]),
@@ -405,6 +475,13 @@ def build_data_loaders(
     num_workers:    int = NUM_WORKERS,
     pin_memory:     bool = False,
     target_classes: list[int] | None = None,
+    use_motionvectors: bool = USE_MOTIONVECTORS,
+    use_residuals: bool = USE_RESIDUALS,
+    train_ratio:    float = TRAIN_RATIO,
+    val_ratio:      float = VAL_RATIO,
+    test_ratio:     float = TEST_RATIO,
+    prefetch_factor: int = 2,
+    persistent_workers: bool | None = None,
 ) -> tuple[DataLoader, DataLoader | list, DataLoader | list]:
     """
     Three ways to call this:
@@ -427,6 +504,9 @@ def build_data_loaders(
 
     Returns (train_loader, val_loader, test_loader).
     """
+    if not use_motionvectors and not use_residuals:
+        raise ValueError("At least one of use_motionvectors or use_residuals must be True.")
+
     if target_classes is not None:
         print(f"[DataLoader] Class filter: keeping YouTube-BB classes {sorted(target_classes)} (no remapping)")
 
@@ -437,17 +517,20 @@ def build_data_loaders(
         window_index = build_window_index(source_data, clip_length=clip_length, stride=stride, snap_to_iframe=snap_to_iframe)        
     
     elif npz_dir is not None:
-        npz_files = sorted(glob.glob(os.path.join(npz_dir, "*.npz")))
-        if not npz_files:
-            raise ValueError(f"No .npz files found in {npz_dir}")
+        sources = _find_video_sources(npz_dir)
+        if not sources:
+            raise ValueError(
+                f"No video sources found in {npz_dir}. "
+                "Expected .npz files or .npy video directories."
+            )
 
         if max_files is not None:
-            npz_files = npz_files[:max_files]
-            
+            sources = sources[:max_files]
+
         if limit_1_video:
-            npz_files = npz_files[:1]
-            
-        source_data  = npz_files
+            sources = sources[:1]
+
+        source_data  = sources
         window_index = lazy_build_window_index(
             source_data, clip_length=clip_length,
             stride=stride, snap_to_iframe=snap_to_iframe,
@@ -473,27 +556,46 @@ def build_data_loaders(
         val_idx   = []
         test_idx  = []
     else:
-        video_splits = _make_video_splits(n_videos)
+        video_splits = _make_video_splits(
+            n_videos=n_videos,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+        )
         train_idx = [i for i, (v_idx, _) in enumerate(window_index) if v_idx in video_splits["train"]]
         val_idx   = [i for i, (v_idx, _) in enumerate(window_index) if v_idx in video_splits["val"]]
         test_idx  = [i for i, (v_idx, _) in enumerate(window_index) if v_idx in video_splits["test"]]
 
-    train_ds = ClipDataset(source_data, window_index, train_idx, clip_length)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers, collate_fn=collate_fn, pin_memory=pin_memory)
-    
+    def _loader_kwargs(shuffle: bool) -> dict:
+        kwargs = {
+            "batch_size": batch_size,
+            "shuffle": shuffle,
+            "num_workers": num_workers,
+            "collate_fn": collate_fn,
+            "pin_memory": pin_memory,
+        }
+
+        if num_workers > 0:
+            kwargs["persistent_workers"] = True if persistent_workers is None else persistent_workers
+            kwargs["prefetch_factor"] = prefetch_factor
+
+        return kwargs
+
+    train_ds = ClipDataset(source_data, window_index, train_idx, clip_length, use_motionvectors=use_motionvectors, use_residuals=use_residuals)
+    train_loader = DataLoader(train_ds, **_loader_kwargs(shuffle=True))
+
     # Safely create val/test only if data exists
     if val_idx:
-        val_ds   = ClipDataset(source_data, window_index, val_idx, clip_length)
-        val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn, pin_memory=pin_memory)
+        val_ds   = ClipDataset(source_data, window_index, val_idx, clip_length, use_motionvectors=use_motionvectors, use_residuals=use_residuals)
+        val_loader   = DataLoader(val_ds, **_loader_kwargs(shuffle=False))
     else:
         val_loader = []
-        
+
     if test_idx:
-        test_ds  = ClipDataset(source_data, window_index, test_idx, clip_length)
-        test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn, pin_memory=pin_memory)
+        test_ds  = ClipDataset(source_data, window_index, test_idx, clip_length, use_motionvectors=use_motionvectors, use_residuals=use_residuals)
+        test_loader  = DataLoader(test_ds, **_loader_kwargs(shuffle=False))
     else:
         test_loader = []
-
     return train_loader, val_loader, test_loader
 
 if __name__ == "__main__":

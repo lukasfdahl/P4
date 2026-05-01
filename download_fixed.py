@@ -28,10 +28,11 @@ import cv_reader
 
 # CONFIG
 CONFIG = {
-    "MODE":            "DOWNLOAD",     # "CHECK" or "DOWNLOAD"
-    "MAX_VIDEOS":      4000,             # Max number of videos to check/download
-    "MAX_WORKERS":     1,              # Number of parallel threads for downloading/checking
-    "TARGET_CLASSES":  [],             # List of class IDs to download, e.g., [1, 23]. Leave empty [] for all.
+    "MODE":            "DOWNLOAD",
+    "MAX_VIDEOS":      500,          # per-class cap now
+    "MAX_VIDEOS_PER_CLASS": 500,     # 500 x 5 = 2500 videos total
+    "MAX_WORKERS":     1,
+    "TARGET_CLASSES":  [1, 2, 6, 9, 11],  # person, bird, bear, dog, motorcycle
     
     "OUTPUT_DIR":      "downloaded_videos/",
     "DATASET_DIR":     "dataset/",
@@ -439,76 +440,77 @@ def _worker_download_and_extract(vid_id, chunks, tmp_dir, output_dir, frame_h, f
 
 
 def run_download(df: pd.DataFrame) -> None:
-    os.makedirs(CONFIG["OUTPUT_DIR"], exist_ok=True)
-    segments  = get_video_segments(df)
+    os.makedirs(CONFIG["DATASET_DIR"], exist_ok=True)
+    segments = get_video_segments(df)
 
-    # 1. Get all IDs and sort them alphabetically to guarantee a stable baseline across machines
     all_video_ids = list(segments.keys())
     all_video_ids.sort()
-    
-    # 2. Apply a reproducible random shuffle if a seed is set
     if CONFIG.get("RANDOM_SEED") is not None:
         rng = random.Random(CONFIG["RANDOM_SEED"])
         rng.shuffle(all_video_ids)
 
-    target = CONFIG["MAX_VIDEOS"]
-    tprint(f"\n[downloader] DOWNLOAD mode")
-    tprint(f"  Target : {target} successful downloads → {CONFIG['OUTPUT_DIR']} (Threads: {CONFIG['MAX_WORKERS']})")
-    if CONFIG.get("RANDOM_SEED") is not None:
-        tprint(f"  Seed   : {CONFIG['RANDOM_SEED']} (Reproducible Mode)")
+    # Build per-class video lists
+    per_class_cap = CONFIG.get("MAX_VIDEOS_PER_CLASS", CONFIG["MAX_VIDEOS"])
+    per_class_ids: dict[int, list[str]] = {c: [] for c in CONFIG["TARGET_CLASSES"]}
+    for vid_id in all_video_ids:
+        vid_classes = df[df["youtube_id"] == vid_id]["class_id"].unique()
+        for c in vid_classes:
+            if c in per_class_ids and len(per_class_ids[c]) < per_class_cap:
+                per_class_ids[c].append(vid_id)
+
+    # Deduplicate while preserving per-class balance
+    seen = set()
+    target_ids = []
+    for c, vids in per_class_ids.items():
+        tprint(f"  Class {c}: {len(vids)} videos queued")
+        for v in vids:
+            if v not in seen:
+                seen.add(v)
+                target_ids.append(v)
+
+    tprint(f"\n[downloader] DOWNLOAD mode — {len(target_ids)} unique videos across {len(CONFIG['TARGET_CLASSES'])} classes")
 
     results = {"success": 0, "skipped": 0, "failed": 0}
-    
+
     with tempfile.TemporaryDirectory(prefix="yt_bb_tmp_") as tmp_dir:
-        index = 0
-        
-        while index < len(all_video_ids) and (results["success"] + results["skipped"]) < target:
-            
-            needed = target - (results["success"] + results["skipped"])
-            batch_vids = all_video_ids[index : index + needed]
-            index += needed
-            
-            if not batch_vids:
-                break 
+        with ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor:
+            futures = {}
+            for vid_id in target_ids:
+                chunks = segments[vid_id]
+                futures[executor.submit(
+                    _worker_download_and_extract, vid_id, chunks,
+                    tmp_dir, CONFIG["DATASET_DIR"], CONFIG["FRAME_H"], CONFIG["FRAME_W"], df
+                )] = vid_id
 
-            with ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor:
-                futures = {}
-                for vid_id in batch_vids:
-                    chunks = segments[vid_id]
-                    futures[executor.submit(
-                        _worker_download_and_extract, vid_id, chunks, 
-                        tmp_dir, CONFIG["DATASET_DIR"], CONFIG["FRAME_H"], CONFIG["FRAME_W"], df
-                    )] = vid_id
-
-                for future in as_completed(futures):
-                    vid_id = futures[future]
-                    try:
-                        res_vid, status = future.result()
-                        if "success" in status:
-                            results["success"] += 1
-                            icon = "✓"
-                        elif status == "skipped":
-                            results["skipped"] += 1
-                            icon = "-"
-                        else:
-                            results["failed"] += 1
-                            icon = "✗"
-                        
-                        current_good = results["success"] + results["skipped"]
-                        tprint(f"  [Good: {current_good}/{target}] {res_vid} {icon} {status}")
-                        
-                    except Exception as e:
+            for future in as_completed(futures):
+                vid_id = futures[future]
+                try:
+                    res_vid, status = future.result()
+                    if "success" in status:
+                        results["success"] += 1
+                        icon = "✓"
+                    elif status == "skipped":
+                        results["skipped"] += 1
+                        icon = "-"
+                    else:
                         results["failed"] += 1
-                        tprint(f"  [Error] {vid_id} ✗ Exception: {e}")
+                        icon = "✗"
+                    total_good = results["success"] + results["skipped"]
+                    tprint(f"  [Good: {total_good}/{len(target_ids)}] {res_vid} {icon} {status}")
+                except Exception as e:
+                    results["failed"] += 1
+                    tprint(f"  [Error] {vid_id} ✗ Exception: {e}")
 
     tprint(f"\n[downloader] Done.")
     tprint(f"  Successfully Downloaded : {results['success']}")
     tprint(f"  Skipped (already exist) : {results['skipped']}")
     tprint(f"  Failed (unavailable)    : {results['failed']}")
-    
-    if (results["success"] + results["skipped"]) < target:
-        tprint(f"  NOTE: Ran out of videos in CSV before reaching target of {target}.")
 
+    # Print final per-class counts
+    tprint("\n[downloader] Per-class summary:")
+    for c, vids in per_class_ids.items():
+        tprint(f"  Class {c}: {len(vids)} queued")
+        
 # Entry point
 def main() -> None:
     if not _check_dependencies():

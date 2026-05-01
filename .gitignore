@@ -12,6 +12,7 @@ model_graph.png
 mlruns/
 
 /import
+.vscode/
 
 RecidualExtraction/
 # C extensions

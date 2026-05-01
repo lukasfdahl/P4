@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, ReduceLROnPlateau, SequentialLR
-from torch_linear_assignment import linear_sum_assignment as gpu_lsa
+from torch_linear_assignment import batch_linear_assignment as gpu_lsa
 
 from model      import ObjectDetector
 from dataloader import build_data_loaders
@@ -152,13 +152,14 @@ def compute_loss(
 
             C = (w_cls * cost_class) + (w_l1 * cost_l1) + (w_giou * cost_giou)
 
-            # C is already on the GPU [Q, num_gt]. 
-            # gpu_lsa returns torch tensors on the same device.
-            row_ind, col_ind = gpu_lsa(C)
-
-            # Cast to long explicitly just to be safe for indexing
-            row_t = row_ind.to(dtype=torch.long)
-            col_t = col_ind.to(dtype=torch.long)
+            # batch_linear_assignment expects [B, Q, N], returns [B, Q]
+            # C is [Q, num_gt] so wrap to [1, Q, num_gt], then squeeze
+            assignment = gpu_lsa(C.unsqueeze(0)).squeeze(0)  # [Q]
+            
+            # assignment[q] = assigned gt index for query q, or -1 if unmatched
+            matched_mask = assignment >= 0
+            row_t = matched_mask.nonzero(as_tuple=True)[0].to(dtype=torch.long)
+            col_t = assignment[matched_mask].to(dtype=torch.long)
 
             matched_boxes    = pred_boxes[b][row_t]
             matched_gt_boxes = valid_gt_boxes[col_t]

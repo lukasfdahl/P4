@@ -18,6 +18,7 @@ resume: null
 
 model:
   num_classes:        23      # YouTube-BB: 23 classes, IDs 1-23 shifted to 0-22.
+  num_queries:        10      # model adds +1 background/no-object class internally
   scales:             [8, 16, 32]
   base_mv_scale:      16       # native H.264 MV block size — don't change
   clip_length:        5        # frames per forward pass — must match data.clip_length
@@ -55,6 +56,9 @@ training:
   batch_size:    256
   seed:          42
   num_workers:   6
+  prefetch_factor: 4
+  persistent_workers: true
+  debug_first_batch: false
   lr:            3.0e-4
   weight_decay:  0
   grad_clip:     1.0           # max gradient norm — important for transformer stability
@@ -72,6 +76,7 @@ loss:
   class_weight:   1.0
   bbox_l1_weight: 5.0          # DETR defaults
   bbox_giou_weight: 2.0
+  no_object_weight:  0.1
 
 # Checkpointing & logging
 paths:

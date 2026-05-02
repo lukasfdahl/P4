@@ -232,13 +232,18 @@ def _download_segment(vid_id: str, chunks: list[tuple[float, float]], tmp_dir: s
         cmd.extend(["--download-sections", section])
         
     cmd.append(url)
-    time.sleep(random.uniform(1, 3))
+    time.sleep(random.uniform(1, 5))  # base delay between requests
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     if result.returncode != 0 or not os.path.exists(out_path):
         error_lines = [line for line in result.stderr.split('\n') if line.strip()]
         error_msg = error_lines[-1] if error_lines else "Unknown yt-dlp error"
+        # Back off longer if rate-limited
+        if "rate-limit" in error_msg.lower() or "rate limit" in error_msg.lower():
+            backoff = random.uniform(60, 120)
+            tprint(f"  [rate-limit] backing off for {backoff:.0f}s...")
+            time.sleep(backoff)
         return None, error_msg
         
     return out_path, ""
@@ -501,15 +506,44 @@ def run_download(df: pd.DataFrame) -> None:
                     results["failed"] += 1
                     tprint(f"  [Error] {vid_id} ✗ Exception: {e}")
 
+    total_good = results['success'] + results['skipped']
+    total_needed = len(target_ids)
+    remaining = results['failed']
+
     tprint(f"\n[downloader] Done.")
     tprint(f"  Successfully Downloaded : {results['success']}")
     tprint(f"  Skipped (already exist) : {results['skipped']}")
     tprint(f"  Failed (unavailable)    : {results['failed']}")
 
-    # Print final per-class counts
-    tprint("\n[downloader] Per-class summary:")
+    if remaining > 0:
+        tprint(f"\n[downloader] WARNING: {remaining} videos failed.")
+        tprint(f"  Re-run the script to retry — already downloaded videos will be skipped.")
+        tprint(f"  If failures are mostly rate-limit errors, wait an hour before re-running.")
+    else:
+        tprint(f"\n[downloader] All videos downloaded successfully!")
+
+    # Print final per-class counts in dataset
+    tprint("\n[downloader] Per-class summary (queued):")
     for c, vids in per_class_ids.items():
         tprint(f"  Class {c}: {len(vids)} queued")
+
+    # Count what actually landed on disk
+    tprint("\n[downloader] Per-class summary (on disk):")
+    import numpy as np
+    from collections import Counter
+    disk_counts: Counter = Counter()
+    dataset_dir = CONFIG["DATASET_DIR"]
+    target_set_0 = {c - 1 for c in CONFIG["TARGET_CLASSES"]}
+    for vid in os.listdir(dataset_dir):
+        cls_path = os.path.join(dataset_dir, vid, "true_class.npy")
+        if not os.path.exists(cls_path):
+            continue
+        cls_arr = np.load(cls_path)
+        for c in set(cls_arr[cls_arr != -1].tolist()) & target_set_0:
+            disk_counts[c] += 1
+    for c in sorted(disk_counts):
+        needed = CONFIG.get("MAX_VIDEOS_PER_CLASS", CONFIG["MAX_VIDEOS"])
+        tprint(f"  Class {c+1}: {disk_counts[c]} / {needed} on disk")
         
 # Entry point
 def main() -> None:

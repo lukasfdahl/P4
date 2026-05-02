@@ -232,18 +232,13 @@ def _download_segment(vid_id: str, chunks: list[tuple[float, float]], tmp_dir: s
         cmd.extend(["--download-sections", section])
         
     cmd.append(url)
-    time.sleep(random.uniform(1, 5))  # base delay between requests
+    time.sleep(random.uniform(1, 3))
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     if result.returncode != 0 or not os.path.exists(out_path):
         error_lines = [line for line in result.stderr.split('\n') if line.strip()]
         error_msg = error_lines[-1] if error_lines else "Unknown yt-dlp error"
-        # Back off longer if rate-limited
-        if "rate-limit" in error_msg.lower() or "rate limit" in error_msg.lower():
-            backoff = random.uniform(60, 120)
-            tprint(f"  [rate-limit] backing off for {backoff:.0f}s...")
-            time.sleep(backoff)
         return None, error_msg
         
     return out_path, ""
@@ -454,96 +449,95 @@ def run_download(df: pd.DataFrame) -> None:
         rng = random.Random(CONFIG["RANDOM_SEED"])
         rng.shuffle(all_video_ids)
 
-    # Build per-class video lists
     per_class_cap = CONFIG.get("MAX_VIDEOS_PER_CLASS", CONFIG["MAX_VIDEOS"])
-    per_class_ids: dict[int, list[str]] = {c: [] for c in CONFIG["TARGET_CLASSES"]}
-    for vid_id in all_video_ids:
-        vid_classes = df[df["youtube_id"] == vid_id]["class_id"].unique()
-        for c in vid_classes:
-            if c in per_class_ids and len(per_class_ids[c]) < per_class_cap:
-                per_class_ids[c].append(vid_id)
+    target_set = set(CONFIG["TARGET_CLASSES"])
 
-    # Deduplicate while preserving per-class balance
-    seen = set()
-    target_ids = []
-    for c, vids in per_class_ids.items():
-        tprint(f"  Class {c}: {len(vids)} videos queued")
-        for v in vids:
-            if v not in seen:
-                seen.add(v)
-                target_ids.append(v)
+    # Count already-downloaded videos on disk toward the cap
+    # so re-runs pick up exactly where they left off
+    per_class_done: dict[int, int] = {c: 0 for c in target_set}
+    dataset_dir = CONFIG["DATASET_DIR"]
+    for vid in os.listdir(dataset_dir):
+        cls_path = os.path.join(dataset_dir, vid, "true_class.npy")
+        if not os.path.exists(cls_path):
+            continue
+        cls_arr = np.load(cls_path)
+        for c in set(cls_arr[cls_arr != -1].tolist()):
+            real_c = int(c) + 1  # stored 0-based, config is 1-based
+            if real_c in per_class_done:
+                per_class_done[real_c] += 1
 
-    tprint(f"\n[downloader] DOWNLOAD mode — {len(target_ids)} unique videos across {len(CONFIG['TARGET_CLASSES'])} classes")
+    tprint("[downloader] Already on disk:")
+    for c in sorted(per_class_done):
+        tprint(f"  Class {c}: {per_class_done[c]} / {per_class_cap}")
 
     results = {"success": 0, "skipped": 0, "failed": 0}
 
     with tempfile.TemporaryDirectory(prefix="yt_bb_tmp_") as tmp_dir:
-        with ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor:
-            futures = {}
-            for vid_id in target_ids:
-                chunks = segments[vid_id]
-                futures[executor.submit(
-                    _worker_download_and_extract, vid_id, chunks,
-                    tmp_dir, CONFIG["DATASET_DIR"], CONFIG["FRAME_H"], CONFIG["FRAME_W"], df
-                )] = vid_id
+        for vid_id in all_video_ids:
+            # Check if all classes are at cap — stop early
+            if all(per_class_done.get(c, 0) >= per_class_cap for c in target_set):
+                tprint("[downloader] All classes at cap — stopping early.")
+                break
 
-            for future in as_completed(futures):
-                vid_id = futures[future]
-                try:
-                    res_vid, status = future.result()
-                    if "success" in status:
-                        results["success"] += 1
-                        icon = "✓"
-                    elif status == "skipped":
-                        results["skipped"] += 1
-                        icon = "-"
-                    else:
-                        results["failed"] += 1
-                        icon = "✗"
-                    total_good = results["success"] + results["skipped"]
-                    tprint(f"  [Good: {total_good}/{len(target_ids)}] {res_vid} {icon} {status}")
-                except Exception as e:
-                    results["failed"] += 1
-                    tprint(f"  [Error] {vid_id} ✗ Exception: {e}")
+            # Check which target classes this video has
+            vid_classes = set(df[df["youtube_id"] == vid_id]["class_id"].unique()) & target_set
 
-    total_good = results['success'] + results['skipped']
-    total_needed = len(target_ids)
-    remaining = results['failed']
+            # Skip if none of its classes still need more videos
+            if not any(per_class_done.get(c, 0) < per_class_cap for c in vid_classes):
+                continue
+
+            # Attempt download
+            chunks = segments[vid_id]
+            res_vid, status = _worker_download_and_extract(
+                vid_id, chunks, tmp_dir,
+                CONFIG["DATASET_DIR"], CONFIG["FRAME_H"], CONFIG["FRAME_W"], df
+            )
+
+            if "success" in status:
+                results["success"] += 1
+                icon = "✓"
+                # Count toward per-class cap only on real success
+                for c in vid_classes:
+                    per_class_done[c] = per_class_done.get(c, 0) + 1
+            elif status == "skipped":
+                results["skipped"] += 1
+                icon = "-"
+                # Already on disk — count toward cap
+                for c in vid_classes:
+                    per_class_done[c] = per_class_done.get(c, 0) + 1
+            else:
+                results["failed"] += 1
+                icon = "✗"
+                # Do NOT count toward cap — will try next candidate
+
+            total_good = results["success"] + results["skipped"]
+            tprint(f"  [{total_good} good | {results['failed']} failed] {res_vid} {icon} {status}")
+            caps = " ".join(f"cls{c}:{per_class_done.get(c,0)}/{per_class_cap}" for c in sorted(target_set))
+            tprint(f"    caps: {caps}")
+
+    total_good = results["success"] + results["skipped"]
+    remaining = {c: per_class_cap - per_class_done.get(c, 0) for c in target_set}
+    still_needed = sum(max(0, v) for v in remaining.values())
 
     tprint(f"\n[downloader] Done.")
     tprint(f"  Successfully Downloaded : {results['success']}")
     tprint(f"  Skipped (already exist) : {results['skipped']}")
     tprint(f"  Failed (unavailable)    : {results['failed']}")
 
-    if remaining > 0:
-        tprint(f"\n[downloader] WARNING: {remaining} videos failed.")
-        tprint(f"  Re-run the script to retry — already downloaded videos will be skipped.")
-        tprint(f"  If failures are mostly rate-limit errors, wait an hour before re-running.")
+    if still_needed > 0:
+        tprint(f"\n[downloader] WARNING: caps not fully met — {still_needed} videos still needed.")
+        for c in sorted(target_set):
+            short = max(0, per_class_cap - per_class_done.get(c, 0))
+            if short > 0:
+                tprint(f"  Class {c}: still need {short} more videos")
+        tprint("  Re-run the script to continue. Already downloaded videos will be skipped.")
+        tprint("  If rate-limited, wait an hour before re-running.")
     else:
-        tprint(f"\n[downloader] All videos downloaded successfully!")
+        tprint(f"\n[downloader] All class caps met!")
 
-    # Print final per-class counts in dataset
-    tprint("\n[downloader] Per-class summary (queued):")
-    for c, vids in per_class_ids.items():
-        tprint(f"  Class {c}: {len(vids)} queued")
-
-    # Count what actually landed on disk
-    tprint("\n[downloader] Per-class summary (on disk):")
-    import numpy as np
-    from collections import Counter
-    disk_counts: Counter = Counter()
-    dataset_dir = CONFIG["DATASET_DIR"]
-    target_set_0 = {c - 1 for c in CONFIG["TARGET_CLASSES"]}
-    for vid in os.listdir(dataset_dir):
-        cls_path = os.path.join(dataset_dir, vid, "true_class.npy")
-        if not os.path.exists(cls_path):
-            continue
-        cls_arr = np.load(cls_path)
-        for c in set(cls_arr[cls_arr != -1].tolist()) & target_set_0:
-            disk_counts[c] += 1
-    for c in sorted(disk_counts):
-        needed = CONFIG.get("MAX_VIDEOS_PER_CLASS", CONFIG["MAX_VIDEOS"])
-        tprint(f"  Class {c+1}: {disk_counts[c]} / {needed} on disk")
+    tprint("\n[downloader] Final per-class on disk:")
+    for c in sorted(target_set):
+        tprint(f"  Class {c}: {per_class_done.get(c, 0)} / {per_class_cap}")
         
 # Entry point
 def main() -> None:

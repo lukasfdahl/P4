@@ -502,9 +502,7 @@ def run_download(df: pd.DataFrame) -> None:
             elif status == "skipped":
                 results["skipped"] += 1
                 icon = "-"
-                # Already on disk — count toward cap
-                for c in vid_classes:
-                    per_class_done[c] = per_class_done.get(c, 0) + 1
+                # Already counted at startup scan — do NOT increment again
             else:
                 results["failed"] += 1
                 icon = "✗"

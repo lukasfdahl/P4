@@ -1,0 +1,57 @@
+# config_P1B.yaml — Phase 1B: DETR paper original settings
+# batch 64, lr 1e-4 — as used in the original DETR paper
+
+experiment_name: "P1_hparam_search"
+run_name:        "P1B_batch64_lr1e-4"
+resume: null
+
+model:
+  num_classes:        23
+  num_queries:        10
+  scales:             [8, 16, 32]
+  base_mv_scale:      16
+  clip_length:        5
+  hidden_dim:         256
+  num_heads:          8
+  num_encoder_layers: 4
+  num_decoder_layers: 4
+
+data:
+  npz_dir:            "dataset/"
+  frame_h:            64
+  frame_w:            64
+  clip_length:        5
+  stride:             5
+  snap_to_iframe:     true
+  use_motionvectors:  true
+  use_residuals:      true
+  train_ratio:        0.7
+  val_ratio:          0.3
+  test_ratio:         0.0
+  max_files:          null
+  max_files_per_class: 100
+  target_classes:     [1, 2, 6, 9, 11]
+
+training:
+  epochs:             100
+  batch_size:         64
+  seed:               42
+  num_workers:        12
+  prefetch_factor:    4
+  persistent_workers: true
+  debug_first_batch:  false
+  lr:                 1.0e-4   # DETR paper original
+  weight_decay:       1.0e-4
+  grad_clip:          1.0
+  scheduler:          "cosine"
+  warmup_epochs:      5
+
+loss:
+  class_weight:       1.0
+  bbox_l1_weight:     5.0
+  bbox_giou_weight:   2.0
+  no_object_weight:   0.1
+
+paths:
+  checkpoint_dir:     "checkpoints/"
+  log_dir:            "runs/"

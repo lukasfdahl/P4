@@ -4,7 +4,6 @@
 #####################
 
 #SBATCH --job-name=objectdetect
-#SBATCH --begin=2026-05-01T00:00:01
 #SBATCH --output=overfit%j.out
 #SBATCH --error=overfit%j.err
 #SBATCH --gres=gpu:1
@@ -30,20 +29,32 @@ mkdir -p "$PROJECT_BIN"
 mkdir -p downloaded_videos
 export PATH="$PROJECT_BIN:$HOME/.local/bin:$PATH"
 
+
 #####################
 # 2. Install Python Dependencies
 #####################
+cat > /tmp/constraints.txt << 'EOF'
+torch==2.9.0a0+50eac811a6.nv25.09
+torchvision==0.24.0a0+98f8b375
+numpy<2.3.0
+EOF
+
 singularity exec --nv -B $PWD:$PWD $CONTAINER \
-    python3 -m pip install --user --no-cache-dir -r requirements.txt
+    python3 -m pip install --user \
+    --constraint /tmp/constraints.txt \
+    -r requirements.txt
+
+singularity exec --nv -B $PWD:$PWD $CONTAINER \
+    python3 -m pip install --user --no-deps \
+    /ceph/project/klnrs/wheels/torch_linear_assignment-0.0.6-cp312-cp312-linux_x86_64.whl
 
 #####################
 # 3. Start MLflow in background
 #####################
-echo "Running on node: $SLURMD_NODENAME"
-
 MLFLOW_PORT=$((8500 + SLURM_JOB_ID % 1000))
 TBBOARD_PORT=$((9500 + SLURM_JOB_ID % 1000))
 
+echo "Running on node: $SLURMD_NODENAME"
 echo "MLflow port:      $MLFLOW_PORT"
 echo "TensorBoard port: $TBBOARD_PORT"
 
@@ -58,7 +69,6 @@ sleep 5
 #####################
 # 4. Run Training
 #####################
-# run_train.slurm — change the python3 line to:
-singularity exec --nv -B $PWD:$PWD $CONTAINER \
-    MLFLOW_PORT=$MLFLOW_PORT \
+singularity exec --nv --env MLFLOW_PORT=$MLFLOW_PORT -B $PWD:$PWD $CONTAINER \
     python3 train.py --config ${CONFIG:-config.yaml}
+

@@ -1,0 +1,69 @@
+# config_resnet50_benchmark.yaml
+# ResNet-50 benchmark — drop-in comparison against P0_baseline.
+#
+# Three variants to run — change the two flags marked with (*)  :
+#
+#   Variant A — fairest architectural comparison (recommended first run)
+#     input_mode: "mv_concat"      pretrained: false
+#
+#   Variant B — does ResNet also benefit from MVs with pretrained weights?
+#     input_mode: "mv_concat"      pretrained: true
+#
+#   Variant C — best pure-RGB ceiling (ImageNet head start, pixels only)
+#     input_mode: "residuals_only" pretrained: true
+#
+# Everything else is intentionally identical to config_P0_baseline.yaml
+# so results are directly comparable.
+
+experiment_name: "resnet50_benchmark"
+run_name:        "resnet50_mv_concat_scratch"   # update to match variant
+resume: null
+
+model:
+  type:           "resnet50"          # tells train.py to build ResNet50Detector
+  num_classes:    23                  # must match P0_baseline — do not change
+  num_queries:    10                  # same as P0_baseline
+  hidden_dim:     256                 # same projection width as P0_baseline
+  base_mv_scale:  16                  # native H.264 MV block size
+  input_mode:     "mv_concat"         # (*) "mv_concat" | "residuals_only"
+  pretrained:     false               # (*) false = from scratch | true = ImageNet init
+
+data:
+  npz_dir:            "dataset/"
+  frame_h:            64              # identical to P0_baseline
+  frame_w:            64              # identical to P0_baseline
+  clip_length:        5
+  stride:             5
+  snap_to_iframe:     true
+  use_motionvectors:  true            # set false when input_mode is "residuals_only"
+  use_residuals:      true
+  train_ratio:        0.7
+  val_ratio:          0.3
+  test_ratio:         0.0
+  max_files:          null
+  max_files_per_class: 500
+  target_classes:     [1, 2, 6, 9, 11]
+
+training:
+  epochs:             300
+  batch_size:         1024
+  seed:               42
+  num_workers:        12
+  prefetch_factor:    4
+  persistent_workers: true
+  debug_first_batch:  false
+  lr:                 1.60e-3
+  weight_decay:       1.0e-4
+  grad_clip:          1.0
+  scheduler:          "cosine"
+  warmup_epochs:      20
+
+loss:
+  class_weight:       1.0
+  bbox_l1_weight:     5.0
+  bbox_giou_weight:   2.0
+  no_object_weight:   0.1
+
+paths:
+  checkpoint_dir:     "checkpoints/"
+  log_dir:            "runs/"

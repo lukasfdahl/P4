@@ -268,7 +268,7 @@ class ClipDataset(Dataset):
         self.is_lazy = len(source_data) > 0 and isinstance(source_data[0], str)
         # LRU cache: keeps last 8 NPZ files open per worker (insertion-order dict)
         self._npz_cache:  dict = {}
-        self._cache_size: int  = 8
+        self._cache_size: int  = 64  # keep last 64 files open per worker (~2500 videos / 12 workers ≈ 208 per worker; 64 covers frequent re-access)
  
     def __len__(self) -> int:
         return len(self.indices)

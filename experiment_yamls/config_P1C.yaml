@@ -33,6 +33,7 @@ data:
   target_classes:     [1, 2, 6, 9, 11]
 
 training:
+  num_gpus:           1
   epochs:             100
   batch_size:         512
   seed:               42

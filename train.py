@@ -497,22 +497,15 @@ def validate(
 
 # Main entry point
 def main(config_path: str, resume: str | None = None, npz_dir_override: str | None = None) -> None:
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    from torch.utils.data.distributed import DistributedSampler
 
-    gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-    os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "false"
-
-    # debug to se gpu metrics different way
-    pynvml.nvmlInit()
-    physical_gpu_id = int(gpu_id.split(",")[0]) if gpu_id.strip() else 0
-    gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(physical_gpu_id)
-
-    # Load config
+    # Load config first so we know num_gpus before touching CUDA
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
         print(f"[train] Loaded config from {config_path}")
 
-    # Override npz_dir if passed from slurm (local scratch is much faster than /ceph)
     if npz_dir_override is not None:
         cfg["data"]["npz_dir"] = npz_dir_override
         print(f"[train] npz_dir overridden to: {npz_dir_override}")
@@ -524,56 +517,69 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
     cfg_paths  = cfg["paths"]
     exp_name   = cfg.get("experiment_name", "experiment")
 
-    torch.manual_seed(cfg_train.get("seed", 42))
+    # DDP setup — controlled by training.num_gpus in yaml.
+    # num_gpus: 1  → single-GPU, no DDP (default, unchanged behaviour)
+    # num_gpus: N  → launch with torchrun --nproc_per_node=N, DDP active
+    # The SLURM script sets nproc_per_node from the yaml automatically.
+    num_gpus   = cfg_train.get("num_gpus", 1)
+    ddp_active = (num_gpus > 1) and dist.is_available()
 
-    # config print
-    print(f"[train] Config: {cfg}")
+    if ddp_active:
+        dist.init_process_group("nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = dist.get_world_size()
+        device     = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+        is_main    = (local_rank == 0)
+        print(f"[train] DDP rank {local_rank}/{world_size} on {device}")
+    else:
+        local_rank = 0
+        world_size = 1
+        is_main    = True
+        os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "false"
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[train] Device: {device}  |  Experiment: {exp_name}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # check for gpu, else cpu. ailab is CUDA.
-    print(f"[train] Device: {device}  |  Experiment: {exp_name}") # print device and experiment name for debug
+    # pynvml GPU handle (only needed on the logging rank)
+    pynvml.nvmlInit()
+    gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
 
-    # mlflow
-    exp_name = cfg.get("experiment_name", "experiment")
-    
-    # Optional: Set tracking URI if your MLflow server is running on a specific host/port
-    # If running locally in the same folder, it defaults to a local ./mlruns directory
+    torch.manual_seed(cfg_train.get("seed", 42) + local_rank)
+
+    if is_main:
+        print(f"[train] Config: {cfg}")
+
+    # mlflow — only rank 0 logs
     mlflow_port = os.environ.get("MLFLOW_PORT", "8501")
-    mlflow.set_tracking_uri(f"http://localhost:{mlflow_port}")
-    mlflow.set_experiment(exp_name)
+    if is_main:
+        mlflow.set_tracking_uri(f"http://localhost:{mlflow_port}")
+        mlflow.set_experiment(exp_name)
 
-    # The previous `with` block closed right after log_params(), before the model
-    # was built, so all log_metrics() calls in the epoch loop were outside the run.
-    run_name = cfg.get("run_name", "training_run")
+    run_name    = cfg.get("run_name", "training_run")
     config_name = os.path.basename(config_path).replace(".yaml", "")
-    mlflow.start_run(run_name=f"{run_name}_{config_name}")
 
+    if is_main:
+        mlflow.start_run(run_name=f"{run_name}_{config_name}")
+        mlflow.set_tag("config_name", config_name)
+        mlflow.set_tag("num_gpus", str(num_gpus))
+        mlflow.log_dict(cfg, "config.yaml")
+        mlflow.log_params({
+            "lr":          cfg_train["lr"],
+            "epochs":      cfg_train["epochs"],
+            "clip_length": cfg_data["clip_length"],
+            "batch_size":  cfg_train.get("batch_size", "unknown"),
+            "num_gpus":    num_gpus,
+        })
+        mlflow.set_tag("config", yaml.dump(cfg, default_flow_style=False))
 
-    mlflow.set_tag("config_name", config_name)
-
-
-    mlflow.log_dict(cfg, "config.yaml")
-    mlflow.log_params({
-        "lr": cfg_train["lr"],
-        "epochs": cfg_train["epochs"],
-        "clip_length": cfg_data["clip_length"],
-        "batch_size": cfg_train.get("batch_size", "unknown")
-    })
-    # Log the full config as a tag so it's readable in the MLflow run overview
-    # without having to download the artifact
-    mlflow.set_tag("config", yaml.dump(cfg, default_flow_style=False))
-    mlflow.set_tag("gpu_id", gpu_id)
-
-    # mixed prec:
-
+    # mixed prec
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-
-    #  Build model 
+    # Build model
     frame_h = cfg_data["frame_h"]
     frame_w = cfg_data["frame_w"]
     scales  = cfg_model["scales"]
 
-    # from model.py
     model = ObjectDetector(
         num_classes        = cfg_model["num_classes"],
         scales             = scales,
@@ -588,8 +594,13 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
         num_queries        = cfg_model.get("num_queries", 10),
     ).to(device)
 
+    # Wrap with DDP if multi-GPU
+    if ddp_active:
+        model = DDP(model, device_ids=[local_rank])
+
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[train] Model parameters: {n_params:,}")
+    if is_main:
+        print(f"[train] Model parameters: {n_params:,}")
 
     # Data loaders
     npz_dir     = cfg_data.get("npz_dir")
@@ -597,10 +608,14 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
     stride      = cfg_data.get("stride", clip_length)
     snap        = cfg_data.get("snap_to_iframe", True)
 
-    # set up data loaders
-    # pin_memory=True pages tensors into pinned (non-pageable) RAM so the
-    # CUDA DMA engine can transfer them to the GPU without a CPU copy,
-    # which significantly reduces the time the GPU sits idle waiting for data.
+    # num_workers: spread CPUs across workers.  With 15 CPUs and 1 GPU, use 12
+    # workers (leaving ~3 for the main process + OS).  With DDP each rank sees
+    # the same cpus-per-task, so keep the per-rank worker count the same.
+    num_workers = cfg_train.get("num_workers", 12)
+
+    # build_data_loaders always returns loaders with shuffle=True for train.
+    # For DDP we need DistributedSampler instead, so we build the datasets
+    # manually here and wrap them ourselves when DDP is active.
     train_loader, val_loader, test_loader = build_data_loaders(
             npz_dir=cfg_data["npz_dir"],
             clip_length=cfg_data["clip_length"],
@@ -609,7 +624,7 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
             max_files=cfg_data.get("max_files"),
             max_files_per_class=cfg_data.get("max_files_per_class"),
             batch_size=cfg_train["batch_size"],
-            num_workers=cfg_train.get("num_workers", 4),
+            num_workers=num_workers,
             pin_memory=(device.type == "cuda"),
             target_classes=cfg_data.get("target_classes", []),
             use_motionvectors=cfg_data.get("use_motionvectors", True),
@@ -617,8 +632,29 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
             train_ratio=cfg_data.get("train_ratio", 0.8),
             val_ratio=cfg_data.get("val_ratio", 0.1),
             test_ratio=cfg_data.get("test_ratio", 0.1),
-            prefetch_factor=cfg_train.get("prefetch_factor", 2),
+            prefetch_factor=cfg_train.get("prefetch_factor", 4),
             persistent_workers=cfg_train.get("persistent_workers", True),
+        )
+
+    # When DDP is active, replace the train DataLoader with one that uses
+    # DistributedSampler so each rank sees a non-overlapping subset of batches.
+    # Val/test stay on rank 0 only — we only eval there.
+    if ddp_active:
+        from torch.utils.data import DataLoader as _DL
+        from torch.utils.data.distributed import DistributedSampler
+        from dataloader import collate_fn as _collate_fn
+        _train_ds  = train_loader.dataset
+        _sampler   = DistributedSampler(_train_ds, num_replicas=world_size,
+                                        rank=local_rank, shuffle=True)
+        train_loader = _DL(
+            _train_ds,
+            batch_size      = cfg_train["batch_size"],
+            sampler         = _sampler,
+            num_workers     = num_workers,
+            pin_memory      = True,
+            collate_fn      = _collate_fn,
+            prefetch_factor = cfg_train.get("prefetch_factor", 4),
+            persistent_workers = True,
         )
 
     # debug
@@ -626,14 +662,15 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
         batch = next(iter(train_loader))
         print({k: v.shape if isinstance(v, torch.Tensor) else "list"
            for k, v in batch.items()})
-    
-    # Safely get sizes even if val/test are empty lists
-    val_size = len(val_loader.dataset) if hasattr(val_loader, 'dataset') else 0
-    test_size = len(test_loader.dataset) if hasattr(test_loader, 'dataset') else 0
 
-    print(f"  Split sizes  |  train={len(train_loader.dataset)}"
-          f"  val={val_size}"
-          f"  test={test_size}")
+    # Safely get sizes even if val/test are empty lists
+    val_size  = len(val_loader.dataset)  if hasattr(val_loader,  "dataset") else 0
+    test_size = len(test_loader.dataset) if hasattr(test_loader, "dataset") else 0
+
+    if is_main:
+        print(f"  Split sizes  |  train={len(train_loader.dataset)}"
+              f"  val={val_size}"
+              f"  test={test_size}")
 
     # configuration
     optimizer = AdamW(
@@ -669,47 +706,56 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
     else:
         raise ValueError(f"Unknown scheduler type: {sched_type}")
 
-    # Checkpoint dir & config snapshot 
+    # Checkpoint dir & config snapshot (rank 0 only)
     ckpt_dir = os.path.join(cfg_paths.get("checkpoint_dir", "checkpoints"), exp_name)
-    os.makedirs(ckpt_dir, exist_ok=True)
+    if is_main:
+        os.makedirs(ckpt_dir, exist_ok=True)
+        with open(os.path.join(ckpt_dir, "config.yaml"), "w") as f:
+            yaml.dump(cfg, f)
 
-    # Save a copy of the config next to the checkpoints for full reproducibility!
-    with open(os.path.join(ckpt_dir, "config.yaml"), "w") as f:
-        yaml.dump(cfg, f)
-
-    # Optionally resume if model fails
-    start_epoch = 0
+    # Optionally resume
+    start_epoch   = 0
     best_val_loss = float("inf")
 
     if resume is not None:
-        ckpt      = load_checkpoint(resume, model, optimizer, scheduler)
+        ckpt          = load_checkpoint(resume, model, optimizer, scheduler)
         start_epoch   = ckpt.get("epoch", 0) + 1
         best_val_loss = ckpt.get("val_loss", float("inf"))
-        print(f"[train] Resuming from epoch {start_epoch}")
+        if is_main:
+            print(f"[train] Resuming from epoch {start_epoch}")
 
     # Training loop
     for epoch in range(start_epoch, epochs):
         t_start = time.time()
 
+        # Tell the DistributedSampler which epoch this is so each rank gets a
+        # different shuffle — required for correct DDP training.
+        if ddp_active:
+            train_loader.sampler.set_epoch(epoch)
+
         train_losses = train_one_epoch(
             model, train_loader, optimizer, cfg_loss, cfg_train, device, scaler
         )
 
-        if val_loader:
-            val_losses, val_metrics = validate(model, val_loader, cfg_loss, device, cfg_model["num_classes"], epoch)
-        else:
-            print("  [train] No validation data, skipping validate()")
-            # use dummy values so the rest of the loop doesn't crash
-            val_losses = {"loss_total": 0.0, "loss_cls": 0.0, "loss_l1": 0.0, "loss_giou": 0.0}
-            val_metrics = None
+        # Validation and logging only on rank 0
+        if is_main:
+            if val_loader:
+                val_losses, val_metrics = validate(model, val_loader, cfg_loss, device, cfg_model["num_classes"], epoch)
+            else:
+                print("  [train] No validation data, skipping validate()")
+                val_losses  = {"loss_total": 0.0, "loss_cls": 0.0, "loss_l1": 0.0, "loss_giou": 0.0}
+                val_metrics = None
 
-        # Step scheduler (warm-up + cosine are both stepped per epoch)
+        # Step scheduler on all ranks (keeps them in sync)
         if sched_type == "plateau":
-            scheduler.step(val_losses["loss_total"])
+            if is_main:
+                scheduler.step(val_losses["loss_total"])
         else:
             scheduler.step()
 
-        # Log training progress
+        if not is_main:
+            continue  # non-main ranks skip logging and checkpointing
+
         elapsed = time.time() - t_start
         lr_now  = optimizer.param_groups[0]["lr"]
 
@@ -723,51 +769,48 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
         )
 
         metrics_to_log = {
-                "train_loss_total": train_losses["loss_total"],
-                "train_loss_cls": train_losses["loss_cls"],
-                "train_loss_l1": train_losses["loss_l1"],
-                "train_loss_giou": train_losses["loss_giou"],
-                "val_loss_total": val_losses["loss_total"],
-                "learning_rate": lr_now
-            }
+            "train_loss_total": train_losses["loss_total"],
+            "train_loss_cls":   train_losses["loss_cls"],
+            "train_loss_l1":    train_losses["loss_l1"],
+            "train_loss_giou":  train_losses["loss_giou"],
+            "val_loss_total":   val_losses["loss_total"],
+            "learning_rate":    lr_now,
+        }
 
         if val_loader:
             metrics_to_log.update({
                 "val_accuracy": val_metrics.accuracy,
-                "val_mAP_50": val_metrics.mAP_50,
-                "val_IoU": val_metrics.iou
+                "val_mAP_50":   val_metrics.mAP_50,
+                "val_IoU":      val_metrics.iou,
             })
 
-        # new method to try to get the gpu metrics
-        mem_info = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
+        mem_info  = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
         util_info = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
-        
         metrics_to_log.update({
-            "my_gpu/memory_used_MB": mem_info.used // (1024 ** 2),
-            "my_gpu/memory_total_MB": mem_info.total // (1024 ** 2),
-            "my_gpu/utilization_percent": util_info.gpu
+            "my_gpu/memory_used_MB":      mem_info.used // (1024 ** 2),
+            "my_gpu/memory_total_MB":     mem_info.total // (1024 ** 2),
+            "my_gpu/utilization_percent": util_info.gpu,
         })
 
         mlflow.log_metrics(metrics_to_log, step=epoch)
-        
+
         if val_loader:
             print(
-            f"| acc {val_metrics.accuracy:.3f} "
-            f"| mAP50 {val_metrics.mAP_50:.3f} "
-            f"| IoU {val_metrics.iou:.3f} "
+                f"| acc {val_metrics.accuracy:.3f} "
+                f"| mAP50 {val_metrics.mAP_50:.3f} "
+                f"| IoU {val_metrics.iou:.3f} "
             )
 
-        print(
-            f"| lr {lr_now:.2e} "
-            f"| {elapsed:.1f}s"
-        )
+        print(f"| lr {lr_now:.2e} | {elapsed:.1f}s")
 
         # Save last checkpoint every epoch
+        # For DDP use model.module to unwrap DDP before saving
+        raw_model = model.module if ddp_active else model
         last_path = os.path.join(ckpt_dir, "last.pt")
         save_checkpoint(
             {
                 "epoch":     epoch,
-                "model":     model.state_dict(),
+                "model":     raw_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "val_loss":  val_losses["loss_total"],
@@ -783,7 +826,7 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
             save_checkpoint(
                 {
                     "epoch":     epoch,
-                    "model":     model.state_dict(),
+                    "model":     raw_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
                     "val_loss":  best_val_loss,
@@ -792,12 +835,15 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
                 best_path,
             )
             print(f"  ↳ New best val_loss {best_val_loss:.4f} — saved to {best_path}")
-
             mlflow.log_artifact(best_path, artifact_path="models")
 
-    print(f"\n[train] Done. Best val_loss: {best_val_loss:.4f}")
-    mlflow.end_run()
+    if is_main:
+        print(f"\n[train] Done. Best val_loss: {best_val_loss:.4f}")
+        mlflow.end_run()
+
     pynvml.nvmlShutdown()
+    if ddp_active:
+        dist.destroy_process_group()
 
 
 # main loop where all is actiaveted

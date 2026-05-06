@@ -10,8 +10,11 @@
 #SBATCH --cpus-per-task=15
 #SBATCH --mem=24G
 #SBATCH --time=12:00:00
+# NOTE: For multi-GPU runs, override at submit time:
+#   sbatch --gres=gpu:2 --ntasks-per-node=2 --export=CONFIG=config_P0_baseline.yaml run_train.slurm
+# and set  training.num_gpus: 2  in the yaml.
 
-CONTAINER=/ceph/container/pytorch/pytorch_25.09.sif 
+CONTAINER=/ceph/container/pytorch/pytorch_25.09.sif
 
 echo "=========================================================="
 echo "Job is running on compute node: $SLURMD_NODENAME"
@@ -68,7 +71,31 @@ sleep 5
 
 #####################
 # 4. Run Training
-#####################
-singularity exec --nv --env MLFLOW_PORT=$MLFLOW_PORT -B $PWD:$PWD $CONTAINER \
-    python3 train.py --config ${CONFIG:-config.yaml}
+# ------------------------------------------------------------
+# Single GPU (default, num_gpus: 1 in yaml):
+#   sbatch --export=CONFIG=config_P1A.yaml run_train.slurm
+#
+# Multi-GPU (e.g. 2 GPUs, num_gpus: 2 in yaml):
+#   sbatch --gres=gpu:2 --ntasks-per-node=2 --export=CONFIG=config_P0_baseline.yaml run_train.slurm
+# ------------------------------------------------------------
+NUM_GPUS=$(singularity exec --nv -B $PWD:$PWD $CONTAINER \
+    python3 -c "
+import yaml, sys
+try:
+    cfg = yaml.safe_load(open('${CONFIG:-config.yaml}'))
+    print(cfg.get('training', {}).get('num_gpus', 1))
+except:
+    print(1)
+" 2>/dev/null)
 
+NUM_GPUS=${NUM_GPUS:-1}
+echo "Launching with NUM_GPUS=$NUM_GPUS"
+
+if [ "$NUM_GPUS" -gt "1" ]; then
+    singularity exec --nv --env MLFLOW_PORT=$MLFLOW_PORT -B $PWD:$PWD $CONTAINER \
+        torchrun --standalone --nproc_per_node=$NUM_GPUS \
+        train.py --config ${CONFIG:-config.yaml}
+else
+    singularity exec --nv --env MLFLOW_PORT=$MLFLOW_PORT -B $PWD:$PWD $CONTAINER \
+        python3 train.py --config ${CONFIG:-config.yaml}
+fi

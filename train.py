@@ -9,7 +9,8 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, ReduceLROnPlateau, SequentialLR
 from torch_linear_assignment import batch_linear_assignment as gpu_lsa
 
-from model      import ObjectDetector
+from model            import ObjectDetector
+from benchmark_models import FasterRCNNDetector, RandomDetector
 from dataloader import build_data_loaders
 from helpers import (
     clips_from_long_videos,
@@ -568,25 +569,42 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
 
-    #  Build model 
-    frame_h = cfg_data["frame_h"]
-    frame_w = cfg_data["frame_w"]
-    scales  = cfg_model["scales"]
+    #  Build model
+    frame_h    = cfg_data["frame_h"]
+    frame_w    = cfg_data["frame_w"]
+    model_type = cfg_model.get("model_type", "objectdetector")
 
-    # from model.py
-    model = ObjectDetector(
-        num_classes        = cfg_model["num_classes"],
-        scales             = scales,
-        base_mv_scale      = cfg_model.get("base_mv_scale", 16),
-        clip_length        = cfg_model["clip_length"],
-        expected_h_tokens  = frame_h // min(scales),
-        expected_w_tokens  = frame_w // min(scales),
-        hidden_dim         = cfg_model.get("hidden_dim", 256),
-        num_heads          = cfg_model.get("num_heads", 8),
-        num_encoder_layers = cfg_model.get("num_encoder_layers", 4),
-        num_decoder_layers = cfg_model.get("num_decoder_layers", 4),
-        num_queries        = cfg_model.get("num_queries", 10),
-    ).to(device)
+    if model_type == "objectdetector":
+        scales = cfg_model["scales"]
+        model = ObjectDetector(
+            num_classes        = cfg_model["num_classes"],
+            scales             = scales,
+            base_mv_scale      = cfg_model.get("base_mv_scale", 16),
+            clip_length        = cfg_model["clip_length"],
+            expected_h_tokens  = frame_h // min(scales),
+            expected_w_tokens  = frame_w // min(scales),
+            hidden_dim         = cfg_model.get("hidden_dim", 256),
+            num_heads          = cfg_model.get("num_heads", 8),
+            num_encoder_layers = cfg_model.get("num_encoder_layers", 4),
+            num_decoder_layers = cfg_model.get("num_decoder_layers", 4),
+            num_queries        = cfg_model.get("num_queries", 10),
+        ).to(device)
+    elif model_type == "fasterrcnn":
+        model = FasterRCNNDetector(
+            num_classes   = cfg_model["num_classes"],
+            num_queries   = cfg_model.get("num_queries", 10),
+            hidden_dim    = cfg_model.get("hidden_dim", 256),
+            input_mode    = cfg_model.get("input_mode", "residuals_only"),
+            pretrained    = cfg_model.get("pretrained", False),
+            base_mv_scale = cfg_model.get("base_mv_scale", 16),
+        ).to(device)
+    elif model_type == "random":
+        model = RandomDetector(
+            num_classes = cfg_model["num_classes"],
+            num_queries = cfg_model.get("num_queries", 10),
+        ).to(device)
+    else:
+        raise ValueError(f"[train] Unknown model_type: '{model_type}'")
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[train] Model parameters: {n_params:,}")

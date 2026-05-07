@@ -1,0 +1,59 @@
+# config_benchmark_fasterrcnn.yaml
+# Benchmark run: ResNet50-FPN (Faster R-CNN backbone) vs ObjectDetector.
+# All data / training / loss / path settings are kept identical to config.yaml
+
+
+experiment_name: "benchmark_fasterrcnn"
+run_name:        "run01_fasterrcnn_scratch"
+
+resume: null
+
+# model_type selects FasterRCNNDetector in train.py's dispatch block.
+model:
+  model_type:    "fasterrcnn"
+  num_classes:   23
+  num_queries:   10
+  hidden_dim:    256
+  input_mode:    "residuals_only"   # "mv_concat" to include motion vectors
+  pretrained:    false              # true = COCO-pretrained FPN backbone
+  base_mv_scale: 16
+
+data:
+  npz_dir:          "dataset/"
+  frame_h:          64
+  frame_w:          64
+  clip_length:      5
+  stride:           4
+  snap_to_iframe:   true
+  use_motionvectors: true
+  use_residuals:    true
+  train_ratio:      0.7
+  val_ratio:        0.3
+  test_ratio:       0.0
+  max_files:        null
+  max_files_per_class: 500
+  target_classes:   [1, 2, 6, 9, 11]
+
+training:
+  epochs:        300
+  batch_size:    256
+  seed:          42
+  num_workers:   6
+  prefetch_factor: 4
+  persistent_workers: true
+  debug_first_batch: false
+  lr:            4.0e-4
+  weight_decay:  1e-4
+  grad_clip:     1.0
+  scheduler:     "cosine"
+  warmup_epochs: 10
+
+loss:
+  class_weight:    1.0
+  bbox_l1_weight:  5.0
+  bbox_giou_weight: 2.0
+  no_object_weight: 0.1
+
+paths:
+  checkpoint_dir: "checkpoints/"
+  log_dir:        "runs/"

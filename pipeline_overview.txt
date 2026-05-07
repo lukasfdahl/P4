@@ -1,0 +1,124 @@
+================================================================================
+  BENCHMARK PIPELINE — FILE OVERVIEW
+  Project: P4 Object Detection Benchmarking
+================================================================================
+
+--------------------------------------------------------------------------------
+  MODELS
+--------------------------------------------------------------------------------
+
+  model.py
+    The main ObjectDetector — a DETR-style transformer with a multi-scale
+    H.264 tokenizer. Accepts motion vectors + residuals as input. This is the
+    model being benchmarked against.
+
+  benchmark_models.py
+    Contains the two benchmark models:
+
+      FasterRCNNDetector
+        ResNet50-FPN backbone (extracted from torchvision's Faster R-CNN).
+        Multi-scale FPN features are globally average-pooled to a single
+        256-d vector, then projected to Q query vectors and passed through
+        the same MLP prediction heads as ObjectDetector.
+
+      RandomDetector
+        Outputs uniformly random boxes and class logits every forward pass.
+        No gradient updates ever occur. Serves as a hard lower-bound baseline.
+
+--------------------------------------------------------------------------------
+  TRAINING & EVALUATION
+--------------------------------------------------------------------------------
+
+  train.py
+    Orchestrates the full pipeline. Reads a YAML config, dispatches on
+    model_type to build the correct model, runs the training loop with mixed
+    precision and gradient clipping, validates each epoch, logs all metrics
+    to MLflow, and saves last/best checkpoints.
+
+  eval_framwork.py
+    Computes evaluation metrics after each validation epoch:
+      - Accuracy       (TP / (TP + FN) at IoU >= 0.5)
+      - mAP@50         (mean average precision at IoU = 0.50)
+      - mAP@95         (mean average precision at IoU = 0.95)
+      - IoU            (mean IoU over matched pairs)
+      - Weighted precision
+    Also produces two visualisations per epoch:
+      - Clip overview  (4 clips side-by-side, GT vs predictions)
+      - Temporal plot  (one clip unrolled across all T frames)
+
+--------------------------------------------------------------------------------
+  DATA PIPELINE
+--------------------------------------------------------------------------------
+
+  dataloader.py
+    Builds the train / val / test DataLoaders from pre-exported NPZ files.
+    Handles batching, shuffling, worker processes, and pin_memory for GPU
+    transfer.
+
+  data_classes.py
+    Dataclass definitions used throughout the pipeline:
+      Frame, Clip, BoundingBox, Prediction, ModelMetric.
+
+  helpers.py
+    Utility functions:
+      - Sliding window clip extraction from long videos
+      - Checkpoint save / load
+      - Coordinate conversion (xyxy <-> xywh)
+      - NPZ dataset loader
+
+--------------------------------------------------------------------------------
+  CONFIGURATION
+--------------------------------------------------------------------------------
+
+  config.yaml
+    Reference configuration for the main ObjectDetector run. Kept here for
+    comparison when tuning the benchmark configs.
+
+  config_benchmark_fasterrcnn.yaml
+    Configuration for the Faster R-CNN benchmark run.
+    Key settings: model_type=fasterrcnn, 300 epochs, same data/loss as
+    the main model for a fair comparison.
+
+  config_benchmark_random.yaml
+    Configuration for the random baseline run.
+    Key settings: model_type=random, 5 epochs (the model never learns so
+    more epochs would waste compute).
+
+--------------------------------------------------------------------------------
+  CLUSTER JOBS (AAU AI Lab / SLURM)
+--------------------------------------------------------------------------------
+
+  run_modbench_fasterrcnn.slurm
+    SLURM job for the Faster R-CNN benchmark.
+    Installs Python dependencies, starts an MLflow tracking server on a
+    dynamic port, then launches: python3 train.py --config config_benchmark_fasterrcnn.yaml
+    Time limit: 12 hours.
+
+  run_modbench_random.slurm
+    SLURM job for the random baseline.
+    Same structure as above but launches with config_benchmark_random.yaml.
+    Time limit: 1 hour (5 epochs, no training computation).
+
+--------------------------------------------------------------------------------
+  DEPENDENCIES
+--------------------------------------------------------------------------------
+
+  requirements.txt
+    Python package list installed by the SLURM jobs at startup before
+    training begins (mlflow, pynvml, tqdm, torch-linear-assignment, etc.).
+
+================================================================================
+  PIPELINE FLOW
+================================================================================
+
+  1. Submit SLURM job (sbatch run_modbench_*.slurm)
+  2. Job installs dependencies from requirements.txt
+  3. MLflow tracking server starts on a dynamic port
+  4. train.py is launched with the relevant config YAML
+  5. train.py reads config → dispatches on model_type → builds model
+  6. Data is loaded via dataloader.py / helpers.py / data_classes.py
+  7. Training loop runs for N epochs with mixed precision
+  8. After each epoch, eval_framwork.py computes metrics + visualisations
+  9. Metrics are logged to MLflow; checkpoints saved to checkpoints/
+
+================================================================================

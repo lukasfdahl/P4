@@ -4,8 +4,8 @@
 #####################
 
 #SBATCH --job-name=objectdetect
-#SBATCH --output=overfit%j.out
-#SBATCH --error=overfit%j.err
+#SBATCH --output=logs/objectdetect_%j.out
+#SBATCH --error=logs/objectdetect_%j.err
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=15
 #SBATCH --mem=24G

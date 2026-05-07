@@ -5,6 +5,8 @@ import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
+import matplotlib.gridspec as gridspec
+from matplotlib.lines import Line2D
 
 
 # Data containers
@@ -94,7 +96,6 @@ def _compute_iou(box_a: BoundingBox, box_b: BoundingBox) -> float:
 
 
 # Matching
-
 def _match_predictions(
     predictions:   List[Prediction],
     ground_truth:  List[BoundingBox],
@@ -128,7 +129,6 @@ def _match_predictions(
 
 
 # Average Precision 
-
 def _compute_ap_for_class(
     predictions:   List[Prediction],
     ground_truth:  List[BoundingBox],
@@ -195,19 +195,6 @@ def evaluate(
 ) -> ModelMetric:
     """
     Compute all detection metrics from per-frame prediction and GT lists.
-
-    Parameters
-    ----------
-    predictions : List[List[Prediction]]
-        One List[Prediction] per frame.
-    ground_truth : List[List[BoundingBox]]
-        One List[BoundingBox] per frame, same ordering as predictions.
-    latency : float
-        Seconds-per-frame measured externally by the caller.
-
-    Returns
-    -------
-    ModelMetric
     """
     if len(predictions) != len(ground_truth):
         raise ValueError(
@@ -359,7 +346,7 @@ def visualize_predictions(
         ax.axis("off")
 
     # Legend
-    from matplotlib.lines import Line2D
+
     legend_elements = [
         Line2D([0], [0], color="lime", linewidth=2, label="Ground Truth"),
         Line2D([0], [0], color="red",  linewidth=2, label="Prediction"),
@@ -383,63 +370,30 @@ def visualize_temporal(
     save_path:       str   = None,
     class_names:     Dict[int, str] = None,
 ) -> None:
-    """
-    Unroll one clip across its T frames left-to-right to reveal temporal stability.
-
-    Layout
-    ------
-    Row 1 (tall): T subplots — one per time-step.
-      - Green box  : GT annotation present at that frame (empty if padding).
-      - Red box    : top-K predictions (same query set shown every frame, since
-                     the model outputs one set of Q queries per clip, not per frame).
-      - Orange spine + "CLASS CHANGED" banner: the GT class at this frame differs
-        from the GT class at the previous annotated frame — makes hopping obvious
-        as you read left-to-right.
-    Row 2 (thin): a colour-coded stability bar (steelblue = stable, orange = changed).
-
-    Parameters
-    ----------
-    clip : dict  — one entry from temporal_clips built in validate():
-        "images"   : List[np.ndarray(H,W,C)]      all T residual frames
-        "gt_per_t" : List[List[BoundingBox]]       GT boxes per time-step (empty if no annotation)
-        "boxes"    : np.ndarray [Q, 4]             clip-level predicted boxes
-        "cls_ids"  : np.ndarray [Q]                argmax class per query
-        "confs"    : np.ndarray [Q]                max softmax confidence per query
-    """
-    import matplotlib.gridspec as gridspec
-
+    
     matplotlib.use("Agg" if save_path else "TkAgg")
 
     images   = clip["images"]    # List[ndarray]
     gt_per_t = clip["gt_per_t"]  # List[List[BoundingBox]]
-    boxes    = clip["boxes"]     # [Q, 4]
-    cls_ids  = clip["cls_ids"]   # [Q]
-    confs    = clip["confs"]     # [Q]
+    boxes    = clip["boxes"]     # [T, Q, 4]  ← per-frame now
+    cls_ids  = clip["cls_ids"]   # [T, Q]
+    confs    = clip["confs"]     # [T, Q]
 
     T = len(images)
     if T == 0:
         print("[eval] visualize_temporal: clip has no frames.")
         return
 
-    # Top-K predictions sorted by confidence (same set shown at every frame)
-    candidates = sorted(
-        [(confs[q], q, int(cls_ids[q]))
-         for q in range(len(confs)) if confs[q] >= conf_threshold],
-        reverse=True,
-    )[:max_preds_shown]
-
-    top1_class = int(candidates[0][2]) if candidates else -1
-
-    # Per-frame change flag: compare GT class at t vs previous annotated frame
+    # Per-frame change flag
     prev_gt_cls: int | None = None
     changed: List[bool] = []
     for t in range(T):
         if gt_per_t[t]:
-            curr    = gt_per_t[t][0].class_id
+            curr = gt_per_t[t][0].class_id
             changed.append(prev_gt_cls is not None and curr != prev_gt_cls)
             prev_gt_cls = curr
         else:
-            changed.append(False)   # no GT → can't determine change
+            changed.append(False)
 
     # Layout: tall image row + thin stability bar
     fig = plt.figure(figsize=(4 * T, 5))
@@ -476,13 +430,18 @@ def visualize_temporal(
             name = (class_names or {}).get(gt.class_id, f"cls {gt.class_id}")
             _draw_box(gt, color="lime", label=f"GT:{name}")
 
-        # Top-K predictions (same every frame — clip-level outputs)
-        for conf, q, cls_id in candidates:
+        # Per-frame top-K predictions
+        frame_candidates = sorted(
+            [(float(confs[t, q]), q, int(cls_ids[t, q]))
+             for q in range(confs.shape[1]) if confs[t, q] >= conf_threshold],
+            reverse=True,
+        )[:max_preds_shown]
+        for conf, q, cls_id in frame_candidates:
             class _B: pass
             b = _B()
             b.xmin, b.xmax, b.ymin, b.ymax = (
-                float(boxes[q, 0]), float(boxes[q, 1]),
-                float(boxes[q, 2]), float(boxes[q, 3]),
+                float(boxes[t, q, 0]), float(boxes[t, q, 1]),
+                float(boxes[t, q, 2]), float(boxes[t, q, 3]),
             )
             name     = (class_names or {}).get(cls_id, f"cls {cls_id}")
             iou_vals = [_compute_iou(b, gt) for gt in gt_per_t[t]] if gt_per_t[t] else [0.0]
@@ -523,7 +482,6 @@ def visualize_temporal(
     ax_bar.set_xticklabels([f"t={t}" for t in range(T)], fontsize=7)
     ax_bar.set_title("GT class stability across clip", fontsize=8, pad=2)
 
-    from matplotlib.lines import Line2D
     legend_elements = [
         Line2D([0], [0], color="lime",      linewidth=2, label="Ground Truth"),
         Line2D([0], [0], color="red",       linewidth=2, label="Prediction"),
@@ -532,6 +490,9 @@ def visualize_temporal(
     ]
     fig.legend(handles=legend_elements, loc="lower center", ncol=4, fontsize=8,
                bbox_to_anchor=(0.5, -0.02))
+    # Most confident prediction across all frames and queries in the clip
+    top1_class = int(cls_ids.flat[int(confs.argmax())]) if confs.size > 0 else -1
+
     fig.suptitle(
         f"Temporal stability  |  top-1 pred = cls {top1_class}  |  T={T} frames",
         fontsize=11, y=1.01,

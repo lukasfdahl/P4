@@ -70,7 +70,10 @@ class MultiScaleH264Tokenizer(nn.Module):
         # Learned global gate — one scalar per scale.
         # Zeros → uniform softmax at initialisation (equal weight to all scales).
         self.scale_gate = nn.Parameter(torch.zeros(len(self.scales)))
- 
+
+        #print learned gate
+        print(f"Learned scale gate: {self.scale_gate.data}")
+
     def forward(
         self,
         motion_vectors: torch.Tensor,   # [B, 4, H_mv, W_mv]   (at base_mv_scale grid)
@@ -311,46 +314,57 @@ class TransformerCore(nn.Module):
             frame_tokens : list of T tensors, each [B, H*W, hidden_dim] — one per frame
             h, w         : spatial token grid dimensions
         Returns:
-            [B, num_queries, hidden_dim]
+            [B, T, num_queries, hidden_dim]  — one query set per frame
         """
         B = frame_tokens[0].size(0)
         T = len(frame_tokens)
 
-        # Stack to [B, T, S, D] then add positional encodings in two vectorised ops
-        # instead of T sequential Python loop iterations.
+        # Stack to [B, T, S, D] then add positional encodings
         all_tokens = torch.stack(frame_tokens, dim=1)  # [B, T, S, D]
 
-        # Spatial encoding: [1, 1, S, D] — same for every frame, broadcast over B and T
+        # Spatial encoding: same for every frame
         sp_key = (h, w)
         if sp_key not in self.spatial_pos._cache:
             self.spatial_pos._cache[sp_key] = self.spatial_pos._build(h, w, all_tokens.device)
         sp_enc = self.spatial_pos._cache[sp_key].unsqueeze(1)  # [1, 1, S, D]
         all_tokens = all_tokens + sp_enc.to(dtype=all_tokens.dtype)
 
-        # Temporal encoding: [1, T, 1, D] — build all T vectors at once, broadcast over B and S
+        # Temporal encoding
         temp_encs = []
         for t in range(T):
             if t not in self.temporal_pos._cache:
                 self.temporal_pos._cache[t] = self.temporal_pos._build(t, all_tokens.device)
-            temp_encs.append(self.temporal_pos._cache[t])  # each [1, 1, D]
-        # [1, T, 1, D]
+            temp_encs.append(self.temporal_pos._cache[t])
         temp_enc = torch.cat(temp_encs, dim=1).unsqueeze(2).to(dtype=all_tokens.dtype)
-        all_tokens = all_tokens + temp_enc  # broadcasts over B and S
+        all_tokens = all_tokens + temp_enc  # [B, T, S, D]
 
         # Flatten to [B, T*S, D] for the encoder
-        all_tokens = all_tokens.flatten(1, 2)
+        all_tokens_flat = all_tokens.flatten(1, 2)
 
-        # Encoder — every token across all frames attends to every other token
-        memory = self.encoder(all_tokens)              # [B, T*H*W, hidden_dim]
+        # Encoder — full spatio-temporal attention
+        memory = self.encoder(all_tokens_flat)   # [B, T*S, D]
 
-        # Expand object queries to the full batch
-        queries = self.object_queries.weight                # [num_queries, hidden_dim]
-        queries = queries.unsqueeze(0).expand(B, -1, -1)   # [B, num_queries, hidden_dim]
+        # Per-frame decoding: each frame gets its own set of Q queries that
+        # cross-attend to the FULL encoder memory (all T frames).
+        # This gives every frame access to temporal context while producing
+        # independent per-frame detections.
+        base_queries = self.object_queries.weight          # [Q, D]
+        base_queries = base_queries.unsqueeze(0).expand(B, -1, -1)  # [B, Q, D]
 
-        # Decoder — each query cross-attends to the full spatio-temporal memory
-        query_output = self.decoder(queries, memory)        # [B, num_queries, hidden_dim]
+        # Decode T times — one query set per frame.
+        # The frame tokens for frame t are used as an additional query signal
+        # (added as residual) to bias each frame's queries toward that frame.
+        frame_outputs = []
+        for t in range(T):
+            # Frame-specific token summary: mean over spatial tokens of frame t → [B, 1, D]
+            frame_ctx = all_tokens[:, t, :, :].mean(dim=1, keepdim=True)  # [B, 1, D]
+            # Bias queries toward this frame without discarding global context
+            frame_queries = base_queries + frame_ctx  # [B, Q, D]
+            out_t = self.decoder(frame_queries, memory) # [B, Q, D]
+            frame_outputs.append(out_t)
 
-        return query_output
+        # Stack to [B, T, Q, D]
+        return torch.stack(frame_outputs, dim=1)
 
 # implement mlp block for both heads
 class MLP(nn.Module):
@@ -515,10 +529,14 @@ class ObjectDetector(nn.Module):
         all_tokens = all_tokens.view(B, T, *all_tokens.shape[1:])
         frame_tokens = list(all_tokens.unbind(dim=1))
 
+        # transformer_output: [B, T, Q, D]
         transformer_output = self.transformer(frame_tokens, h_tokens, w_tokens)
+
+        # PredictionHeads applies the same MLP to any leading dims — works on [B, T, Q, D]
+        # and returns boxes [B, T, Q, 4], classes [B, T, Q, C+1]
         final_boxes, final_classes = self.prediction_heads(transformer_output)
 
-        return final_boxes, final_classes
+        return final_boxes, final_classes   # [B, T, Q, 4], [B, T, Q, C+1]
 
 
 # Wrapper for torchinfo summary (hides iframe_mask from the signature)

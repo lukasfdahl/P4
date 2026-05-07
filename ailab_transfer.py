@@ -46,13 +46,11 @@ def styled_entry(parent, show=None, **kw):
     return e
 
 
+# UI stuff
 def marine_btn(parent, text, command, width=18, accent=False):
     bg  = ACCENT   if accent else MARINE
     hov = "#C8870F" if accent else MARINE_LT
 
-    # Use Label instead of Button — tk.Button bg/fg is overridden by the
-    # system theme on Linux/macOS (dark mode), making it unreadable.
-    # Labels always honour the colours we set.
     btn = tk.Label(
         parent,
         text=text,
@@ -144,6 +142,8 @@ def divider(parent):
 # Main App
 
 class AILabTransfer(tk.Tk):
+
+    #choose endpoints
     SERVERS = [
         "ailab-fe01.srv.aau.dk",
         "ailab-fe02.srv.aau.dk",
@@ -286,6 +286,7 @@ class AILabTransfer(tk.Tk):
         ghost_btn(btn_row, "←  Back", self._show_server_page).pack(side="left")
         marine_btn(btn_row, "Sign In  →", self._do_login, accent=True).pack(side="right")
 
+    # Login logic
     def _do_login(self):
         self._login_status.config(text="Connecting…", fg=TEXT_MID)
         self.update_idletasks()
@@ -639,6 +640,7 @@ class AILabTransfer(tk.Tk):
         self._transfer_btn.config(state="normal")
 
 
+# run the script
 if __name__ == "__main__":
     try:
         from ctypes import windll

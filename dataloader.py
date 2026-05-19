@@ -259,6 +259,7 @@ def build_data_loaders(
     test_ratio:          float        = TEST_RATIO,
     prefetch_factor:     int          = 2,
     persistent_workers:  bool | None  = None,
+    sequential_io:       bool         = False,
 ) -> tuple[DataLoader, DataLoader | list, DataLoader | list]:
     """
     Build train / val / test DataLoaders.
@@ -266,6 +267,9 @@ def build_data_loaders(
     Pass npz_dir to use real data; omit it for synthetic dummy data (smoke tests).
     target_classes uses 1-based YouTube-BB IDs — they are NOT remapped in outputs.
     Split is done at video level to prevent data leakage between splits.
+
+    sequential_io=True sorts train windows by source_idx so all clips from one
+    folder are read together — reduces random HDD seeks at cost of shuffle.
     """
 
     #debug if features are not used
@@ -355,6 +359,10 @@ def build_data_loaders(
     test_idx  = [i for i, (s, _) in enumerate(window_index) if s in test_vids]
     _tlog(f"[DataLoader] split  train={len(train_idx)}  val={len(val_idx)}  test={len(test_idx)}")
 
+    if sequential_io:
+        train_idx.sort(key=lambda i: (window_index[i][0], window_index[i][1]))
+        _tlog("[DataLoader] sequential_io=True — train index sorted by source folder")
+
     def _ds(idxs):
         return ClipDataset(
             sources, window_index, idxs, clip_length,
@@ -376,7 +384,7 @@ def build_data_loaders(
         return DataLoader(_ds(idxs), **kw)
 
     _tlog("[DataLoader] constructing DataLoaders...")
-    train_loader = _loader(train_idx, shuffle=True)
+    train_loader = _loader(train_idx, shuffle=(not sequential_io))
     val_loader   = _loader(val_idx,   shuffle=False) if val_idx  else []
     test_loader  = _loader(test_idx,  shuffle=False) if test_idx else []
     _tlog("[DataLoader] DataLoaders ready")

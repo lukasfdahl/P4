@@ -66,6 +66,16 @@ def _load_source(path: str) -> dict:
 # # Stores frame_types and true_class for every video so the window index can be
 # built without loading the large motion-vector and residual arrays.
 META_FNAME = ".dataset_meta.pkl"
+_CACHE_DIR = os.path.expanduser("~/.cache/p4_dataset")
+
+def _cache_path_for(data_dir: str, filename: str) -> str:
+    """Writable cache path under ~/.cache/p4_dataset/, keyed by data_dir hash."""
+    try:
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        dir_hash = hashlib.md5(data_dir.encode()).hexdigest()[:12]
+        return os.path.join(_CACHE_DIR, f"{dir_hash}_{filename}")
+    except OSError:
+        return os.path.join(data_dir, filename)
 
 def _build_or_load_meta(sources: list[str], data_dir: str) -> dict:
     """
@@ -73,7 +83,7 @@ def _build_or_load_meta(sources: list[str], data_dir: str) -> dict:
     Only reads the small arrays (frame_types, true_class) — never MV or residuals.
     Cache is invalidated if any source file is newer than the cache file.
     """
-    meta_path = os.path.join(data_dir, META_FNAME)
+    meta_path = _cache_path_for(data_dir, META_FNAME)
 
     if os.path.exists(meta_path):
         meta_mtime = os.path.getmtime(meta_path)
@@ -131,8 +141,8 @@ def _build_window_index(
     Windows whose clips contain no target-class frame are dropped.
     Result is cached per parameter signature and reused on subsequent runs.
     """
-    cache_path = os.path.join(data_dir, f".window_index_{cache_sig}.pkl")
-    meta_path  = os.path.join(data_dir, META_FNAME)
+    cache_path = _cache_path_for(data_dir, f".window_index_{cache_sig}.pkl")
+    meta_path  = _cache_path_for(data_dir, META_FNAME)
 
     if os.path.exists(cache_path) and os.path.exists(meta_path):
         if os.path.getmtime(cache_path) >= os.path.getmtime(meta_path):

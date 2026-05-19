@@ -187,6 +187,109 @@ def _compute_ap_for_class(
     return ap / 11.0
 
 
+# Vectorised fast helpers
+# Pure-Python loops in _compute_ap_for_class are O(N x M) per class per threshold,
+# which is prohibitive at 100k+ predictions.  Numpy versions below preserve the
+# same matching logic but vectorise the IoU computation, giving 100-1000x speedup.
+
+def _boxes_to_array(boxes):
+    """Convert list of BoundingBox/Prediction → np.array [N, 4] (xmin, xmax, ymin, ymax)."""
+    if not boxes:
+        return np.zeros((0, 4), dtype=np.float32)
+    return np.array([(b.xmin, b.xmax, b.ymin, b.ymax) for b in boxes], dtype=np.float32)
+
+
+def _pairwise_iou(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Pairwise IoU between box arrays a [N, 4] and b [M, 4].
+    Returns IoU matrix [N, M].  Boxes in [xmin, xmax, ymin, ymax] format.
+    """
+    if a.shape[0] == 0 or b.shape[0] == 0:
+        return np.zeros((a.shape[0], b.shape[0]), dtype=np.float32)
+
+    ix1 = np.maximum(a[:, None, 0], b[None, :, 0])
+    ix2 = np.minimum(a[:, None, 1], b[None, :, 1])
+    iy1 = np.maximum(a[:, None, 2], b[None, :, 2])
+    iy2 = np.minimum(a[:, None, 3], b[None, :, 3])
+
+    inter = np.maximum(0.0, ix2 - ix1) * np.maximum(0.0, iy2 - iy1)
+    area_a = ((a[:, 1] - a[:, 0]) * (a[:, 3] - a[:, 2]))[:, None]
+    area_b = ((b[:, 1] - b[:, 0]) * (b[:, 3] - b[:, 2]))[None, :]
+    union  = area_a + area_b - inter
+    return np.where(union > 0, inter / union, 0.0)
+
+
+def _compute_ap_for_class_fast(
+    class_preds, class_gts, iou_threshold: float,
+) -> float:
+    """Vectorised AP for one class — same logic as _compute_ap_for_class."""
+    if not class_gts or not class_preds:
+        return 0.0
+
+    # Sort predictions by confidence descending
+    class_preds = sorted(class_preds, key=lambda p: p.confidence, reverse=True)
+
+    pred_arr = _boxes_to_array(class_preds)
+    gt_arr   = _boxes_to_array(class_gts)
+    iou_mat  = _pairwise_iou(pred_arr, gt_arr)        # [N_pred, N_gt]
+
+    matched_gt = np.zeros(gt_arr.shape[0], dtype=bool)
+    tp = np.zeros(len(class_preds), dtype=np.int32)
+    fp = np.zeros(len(class_preds), dtype=np.int32)
+
+    for i in range(len(class_preds)):
+        ious   = iou_mat[i]
+        ious   = np.where(matched_gt, -1.0, ious)     # mask used GTs
+        best_j = int(np.argmax(ious))
+        if ious[best_j] >= iou_threshold:
+            tp[i] = 1
+            matched_gt[best_j] = True
+        else:
+            fp[i] = 1
+
+    cum_tp = np.cumsum(tp)
+    cum_fp = np.cumsum(fp)
+    recalls    = cum_tp / len(class_gts)
+    precisions = cum_tp / np.maximum(cum_tp + cum_fp, 1)
+
+    # 11-point interpolation (same as VOC, matches the original)
+    ap = 0.0
+    for r_thresh in [t / 10 for t in range(11)]:
+        mask = recalls >= r_thresh
+        ap += precisions[mask].max() if mask.any() else 0.0
+    return ap / 11.0
+
+
+def _match_predictions_fast(predictions, ground_truth, iou_threshold: float):
+    """Vectorised version of _match_predictions — same greedy logic."""
+    if not predictions or not ground_truth:
+        return [], list(ground_truth)
+
+    sorted_preds = sorted(predictions, key=lambda p: p.confidence, reverse=True)
+    pred_arr = _boxes_to_array(sorted_preds)
+    gt_arr   = _boxes_to_array(ground_truth)
+
+    # Class-equality mask: predictions x GTs
+    pred_cls = np.array([p.class_id for p in sorted_preds])
+    gt_cls   = np.array([g.class_id for g in ground_truth])
+    cls_ok   = pred_cls[:, None] == gt_cls[None, :]
+
+    iou_mat  = _pairwise_iou(pred_arr, gt_arr)
+    iou_mat  = np.where(cls_ok, iou_mat, 0.0)
+
+    used   = np.zeros(len(ground_truth), dtype=bool)
+    matched = []
+    for i, pred in enumerate(sorted_preds):
+        ious   = np.where(used, -1.0, iou_mat[i])
+        best_j = int(np.argmax(ious))
+        if ious[best_j] >= iou_threshold:
+            matched.append((pred, ground_truth[best_j], float(ious[best_j])))
+            used[best_j] = True
+
+    unmatched_gt = [g for j, g in enumerate(ground_truth) if not used[j]]
+    return matched, unmatched_gt
+
+
 # Main evaluator
 def evaluate(
     predictions:  List[List[Prediction]],
@@ -211,7 +314,7 @@ def evaluate(
     tp_ious: List[float] = []
 
     for preds, gts in zip(predictions, ground_truth):
-        matched, unmatched_gt = _match_predictions(preds, gts, iou_threshold=0.5)
+        matched, unmatched_gt = _match_predictions_fast(preds, gts, iou_threshold=0.5)
         total_tp += len(matched)
         total_fn += len(unmatched_gt)
         tp_ious.extend(iou for _, _, iou in matched)
@@ -225,12 +328,20 @@ def evaluate(
     # mAP_50 and mAP_95
     class_ids = list({g.class_id for g in all_gts})
 
+    # Pre-bucket predictions and GTs by class once (avoids 2 x N x C filter passes)
+    preds_by_class: Dict[int, List[Prediction]]  = defaultdict(list)
+    gts_by_class:   Dict[int, List[BoundingBox]] = defaultdict(list)
+    for p in all_preds:
+        preds_by_class[p.class_id].append(p)
+    for g in all_gts:
+        gts_by_class[g.class_id].append(g)
+
     ap50_per_class = [
-        _compute_ap_for_class(all_preds, all_gts, 0.50, cid)
+        _compute_ap_for_class_fast(preds_by_class[cid], gts_by_class[cid], 0.50)
         for cid in class_ids
     ]
     ap95_per_class = [
-        _compute_ap_for_class(all_preds, all_gts, 0.95, cid)
+        _compute_ap_for_class_fast(preds_by_class[cid], gts_by_class[cid], 0.95)
         for cid in class_ids
     ]
 
@@ -248,7 +359,7 @@ def evaluate(
     for class_id in class_ids:
         class_preds = [p for p in all_preds if p.class_id == class_id]
         class_gts   = [g for g in all_gts   if g.class_id == class_id]
-        matched, _  = _match_predictions(class_preds, class_gts, iou_threshold=0.5)
+        matched, _  = _match_predictions_fast(class_preds, class_gts, iou_threshold=0.5)
         tp        = len(matched)
         fp        = len(class_preds) - tp
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0

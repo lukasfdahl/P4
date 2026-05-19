@@ -34,8 +34,8 @@ CONFIG = {
     "MAX_WORKERS":     1,
     "TARGET_CLASSES":  [1, 2, 6, 9, 11],  # person, bird, bear, dog, motorcycle
     
-    "OUTPUT_DIR":      "downloaded_videos/",
-    "DATASET_DIR":     "dataset/",
+    "OUTPUT_DIR":      "/mnt/hdd/dataset/",
+    "DATASET_DIR":     "/mnt/hdd/dataset/",
     "RANDOM_SEED":     42,
 
     # Auto-download URLs for the dataset
@@ -239,16 +239,38 @@ def _download_segment(vid_id: str, chunks: list[tuple[float, float]], tmp_dir: s
         cmd.extend(["--download-sections", section])
         
     cmd.append(url)
-    time.sleep(random.uniform(1, 3))
+    time.sleep(random.uniform(2, 5))
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result.returncode != 0 or not os.path.exists(out_path):
-        error_lines = [line for line in result.stderr.split('\n') if line.strip()]
+    # Retry with exponential backoff on rate-limit errors
+    # Waits: 10s, 30s, 60s, 300s, 1800s before giving up
+    RATE_LIMIT_WAITS = [10, 30, 60, 300, 1800]
+
+    for attempt in range(len(RATE_LIMIT_WAITS) + 1):
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        # Success
+        if result.returncode == 0 and os.path.exists(out_path):
+            return out_path, ""
+
+        stderr = result.stderr
+
+        # Check if it's a rate-limit — if so, wait and retry
+        is_rate_limited = "rate-limited" in stderr or "try again later" in stderr
+
+        if is_rate_limited and attempt < len(RATE_LIMIT_WAITS):
+            wait = RATE_LIMIT_WAITS[attempt]
+            mins = f"{wait // 60}m {wait % 60}s" if wait >= 60 else f"{wait}s"
+            tprint(f"  [rate-limit] {vid_id} — attempt {attempt + 1}/{len(RATE_LIMIT_WAITS)}, waiting {mins}...")
+            time.sleep(wait)
+            continue
+
+        # Non-rate-limit error or out of retries — give up on this video
+        error_lines = [line for line in stderr.split('\n') if line.strip()]
         error_msg = error_lines[-1] if error_lines else "Unknown yt-dlp error"
         return None, error_msg
-        
-    return out_path, ""
+
+    # Should never reach here
+    return None, "Exhausted all retries"
 
 def _path_size_mb(path: str) -> float:
     if os.path.isfile(path):

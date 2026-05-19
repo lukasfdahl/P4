@@ -25,6 +25,7 @@ from tqdm import tqdm
 import logging
 import argparse
 import random as _random
+import gc
 
 # Train / validate one epoch
 def train_one_epoch(
@@ -293,6 +294,20 @@ def validate(
         )
         mlflow.log_artifact(temp_path, artifact_path="visuals")
 
+    # Cleanup to prevent RAM growth across epochs
+    all_frame_preds.clear()
+    all_frame_gts.clear()
+    _vis_res_gpu.clear()
+    _vis_gt_boxes_gpu.clear()
+    _vis_gt_classes_gpu.clear()
+    _vis_boxes_gpu.clear()
+    _vis_cls_ids_gpu.clear()
+    _vis_confs_gpu.clear()
+    temporal_clips.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return avg_losses, metrics
 
 # Main entry point
@@ -396,6 +411,7 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
             test_ratio=cfg_data.get("test_ratio", 0.1),
             prefetch_factor=cfg_train.get("prefetch_factor", 4),
             persistent_workers=cfg_train.get("persistent_workers", True),
+            sequential_io=cfg_data.get("sequential_io", False),
         )
 
     # debug
@@ -455,6 +471,7 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
     # Optionally resume
     start_epoch   = 0
     best_val_loss = float("inf")
+    best_epoch    = 0
 
     if resume is not None:
         ckpt          = load_checkpoint(resume, model, optimizer, scheduler)
@@ -478,91 +495,103 @@ def main(config_path: str, resume: str | None = None, npz_dir_override: str | No
             val_losses  = {"loss_total": 0.0, "loss_cls": 0.0, "loss_l1": 0.0, "loss_giou": 0.0}
             val_metrics = None
 
-    # Step scheduler
-    if sched_type == "plateau":
-        scheduler.step(val_losses["loss_total"])
-    else:
-        scheduler.step()
+        # Step scheduler
+        if sched_type == "plateau":
+            scheduler.step(val_losses["loss_total"])
+        else:
+            scheduler.step()
 
-    elapsed = time.time() - t_start
-    lr_now  = optimizer.param_groups[0]["lr"]
+        elapsed = time.time() - t_start
+        lr_now  = optimizer.param_groups[0]["lr"]
 
-    print(
-        f"Epoch {epoch+1:03d}/{epochs} "
-        f"| train_loss {train_losses['loss_total']:.4f} "
-        f"(cls {train_losses['loss_cls']:.3f} "
-        f"l1 {train_losses['loss_l1']:.3f} "
-        f"giou {train_losses['loss_giou']:.3f}) "
-        f"| val_loss {val_losses['loss_total']:.4f} "
-    )
-
-    metrics_to_log = {
-        "train_loss_total": train_losses["loss_total"],
-        "train_loss_cls":   train_losses["loss_cls"],
-        "train_loss_l1":    train_losses["loss_l1"],
-        "train_loss_giou":  train_losses["loss_giou"],
-        "val_loss_total":   val_losses["loss_total"],
-        "learning_rate":    lr_now,
-    }
-
-    if val_loader:
-        metrics_to_log.update({
-            "val_accuracy": val_metrics.accuracy,
-            "val_mAP_50":   val_metrics.mAP_50,
-            "val_IoU":      val_metrics.iou,
-        })
-
-    mem_info  = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
-    util_info = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
-    metrics_to_log.update({
-        "my_gpu/memory_used_MB":      mem_info.used // (1024 ** 2),
-        "my_gpu/memory_total_MB":     mem_info.total // (1024 ** 2),
-        "my_gpu/utilization_percent": util_info.gpu,
-    })
-
-    mlflow.log_metrics(metrics_to_log, step=epoch)
-
-    if val_loader:
         print(
-            f"| acc {val_metrics.accuracy:.3f} "
-            f"| mAP50 {val_metrics.mAP_50:.3f} "
-            f"| IoU {val_metrics.iou:.3f} "
+            f"Epoch {epoch+1:03d}/{epochs} "
+            f"| train_loss {train_losses['loss_total']:.4f} "
+            f"(cls {train_losses['loss_cls']:.3f} "
+            f"l1 {train_losses['loss_l1']:.3f} "
+            f"giou {train_losses['loss_giou']:.3f}) "
+            f"| val_loss {val_losses['loss_total']:.4f} "
         )
 
-    print(f"| lr {lr_now:.2e} | {elapsed:.1f}s")
+        metrics_to_log = {
+            "train_loss_total": train_losses["loss_total"],
+            "train_loss_cls":   train_losses["loss_cls"],
+            "train_loss_l1":    train_losses["loss_l1"],
+            "train_loss_giou":  train_losses["loss_giou"],
+            "val_loss_total":   val_losses["loss_total"],
+            "learning_rate":    lr_now,
+        }
 
-    # Save last checkpoint every epoch
-    raw_model = model
-    last_path = os.path.join(ckpt_dir, "last.pt")
-    save_checkpoint(
-        {
-            "epoch":     epoch,
-            "model":     raw_model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "val_loss":  val_losses["loss_total"],
-            "config":    cfg,
-        },
-        last_path,
-    )
+        if val_loader:
+            metrics_to_log.update({
+                "val_accuracy": val_metrics.accuracy,
+                "val_mAP_50":   val_metrics.mAP_50,
+                "val_IoU":      val_metrics.iou,
+            })
 
-    # Save best checkpoint when val loss improves
-    if val_losses["loss_total"] < best_val_loss:
-        best_val_loss = val_losses["loss_total"]
-        best_path = os.path.join(ckpt_dir, "best.pt")
+        mem_info  = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
+        util_info = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
+        metrics_to_log.update({
+            "my_gpu/memory_used_MB":      mem_info.used // (1024 ** 2),
+            "my_gpu/memory_total_MB":     mem_info.total // (1024 ** 2),
+            "my_gpu/utilization_percent": util_info.gpu,
+        })
+
+        mlflow.log_metrics(metrics_to_log, step=epoch)
+
+        if val_loader:
+            print(
+                f"| acc {val_metrics.accuracy:.3f} "
+                f"| mAP50 {val_metrics.mAP_50:.3f} "
+                f"| IoU {val_metrics.iou:.3f} "
+            )
+
+        print(f"| lr {lr_now:.2e} | {elapsed:.1f}s")
+
+        # Save last checkpoint every epoch
+        raw_model = model
+        last_path = os.path.join(ckpt_dir, "last.pt")
         save_checkpoint(
             {
                 "epoch":     epoch,
                 "model":     raw_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
-                "val_loss":  best_val_loss,
+                "val_loss":  val_losses["loss_total"],
                 "config":    cfg,
             },
-            best_path,
+            last_path,
         )
-        print(f"  > New best val_loss {best_val_loss:.4f} — saved to {best_path}")
-        mlflow.log_artifact(best_path, artifact_path="models")
+
+        # Save best checkpoint when val loss improves
+        if val_losses["loss_total"] < best_val_loss:
+            best_val_loss = val_losses["loss_total"]
+            best_epoch    = epoch
+            best_path = os.path.join(ckpt_dir, "best.pt")
+            save_checkpoint(
+                {
+                    "epoch":     epoch,
+                    "model":     raw_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "val_loss":  best_val_loss,
+                    "config":    cfg,
+                },
+                best_path,
+            )
+            print(f"  > New best val_loss {best_val_loss:.4f} — saved to {best_path}")
+            mlflow.log_artifact(best_path, artifact_path="models")
+
+        # End-of-epoch memory cleanup
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Early stopping
+        patience = cfg_train.get("early_stopping_patience", 0)
+        if patience > 0 and (epoch - best_epoch) >= patience:
+            print(f"[train] Early stopping at epoch {epoch+1} — no improvement for {patience} epochs (best was epoch {best_epoch+1})")
+            break
 
     print(f"\n[train] Done. Best val_loss: {best_val_loss:.4f}")
     mlflow.end_run()

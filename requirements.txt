@@ -1,3 +1,19 @@
-motion-vector-extractor==2.0.0
-numpy==2.4.2
-opencv-python==4.13.0.92
+# MLflow & System Tracking
+mlflow
+psutil
+nvidia-ml-py
+
+# Data Downloading & Processing 
+yt-dlp
+pandas
+opencv-python-headless>=4.10.0
+
+# Configuration & Architecture
+pyyaml
+torchinfo
+torchview
+graphviz
+pynvml
+tqdm
+
+torch-linear-assignment

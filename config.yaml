@@ -1,0 +1,86 @@
+# config.yaml  –  experiment configuration for ObjectDetector training
+
+# Copy and rename this file per experiment, e.g. "exp01_test1.yaml".
+# train.py loads this file and logs its full contents to the run directory
+# so every checkpoint is reproducible.
+
+experiment_name: "baseline_5class_300ep"
+run_name:        "run01_5class_baseline"
+
+
+# Resume training from a checkpoint.
+# Set to the path of last.pt to continue after a time-limit, or null to start fresh.
+# Example: resume: "checkpoints/test123/last.pt"
+resume: null
+
+# Model architecture
+# All values here are forwarded directly to ObjectDetector.__init__()
+
+model:
+  num_classes:        23      # YouTube-BB: 23 classes, IDs 1-23 shifted to 0-22.
+  num_queries:        10      # model adds +1 background/no-object class internally
+  scales:             [8, 16, 32]
+  base_mv_scale:      16       # native H.264 MV block size — don't change
+  clip_length:        5        # frames per forward pass — must match data.clip_length
+  hidden_dim:         256
+  num_heads:          8
+  num_encoder_layers: 4
+  num_decoder_layers: 4
+  # ffn_dim defaults to 4 * hidden_dim if omitted
+  # expected_h/w_tokens are extracted automatically from frame_h/w and min(scales)
+
+
+# Data pipeline
+data:
+  npz_dir:          "dataset/"
+  frame_h:          64
+  frame_w:          64
+  clip_length:      5          # must match model.clip_length
+  stride:           4          # sliding-window stride (frames).
+                               # stride=clip_length → no overlap (fastest)
+                               # stride=1           → maximum overlap (slowest, most clips)
+  snap_to_iframe:   true
+  use_motionvectors: true
+  use_residuals:    true
+  train_ratio:      0.7
+  val_ratio:        0.3
+  test_ratio:       0.0
+  max_files:        null           # set to null to use max_files_per_class instead
+  max_files_per_class: 500         # cap per class — null for all videos
+
+  # Class filter — only windows containing at least one of these classes are loaded.
+  # YouTube-BB IDs (1-based): 1=person, 2=bird, 6=bear, 9=dog, 11=motorcycle
+  target_classes:   [1, 2, 6, 9, 11]
+
+# Training loop
+training:
+  epochs:        300
+  batch_size:    256
+  seed:          42
+  num_workers:   6
+  prefetch_factor: 4
+  persistent_workers: true
+  debug_first_batch: false
+  lr:            4.0e-4        # scaled from DETR 1e-4 @ batch64 → batch256
+  weight_decay:  1e-4
+  grad_clip:     1.0           # max gradient norm — important for transformer stability
+
+  # Learning-rate scheduler
+  # "cosine" → CosineAnnealingLR over all epochs
+  # "plateau" → ReduceLROnPlateau (monitors val loss)
+  scheduler:     "cosine"
+  warmup_epochs: 10            # longer warmup for stability at higher lr
+
+# Loss function
+# bbox loss = l1_weight * L1  +  giou_weight * GIoU
+# All three weights can be set to 0.0 to disable that term.
+loss:
+  class_weight:   1.0
+  bbox_l1_weight: 5.0          # DETR defaults
+  bbox_giou_weight: 2.0
+  no_object_weight:  0.1
+
+# Checkpointing & logging
+paths:
+  checkpoint_dir: "checkpoints/"
+  log_dir:        "runs/"

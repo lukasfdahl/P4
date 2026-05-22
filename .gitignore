@@ -1,8 +1,20 @@
+downloaded_videos/
+dataset/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
 *$py.class
 
+checkpoints/
+
+model_graph.png
+mlruns/
+
+/import
+.vscode/
+
+RecidualExtraction/
 # C extensions
 *.so
 

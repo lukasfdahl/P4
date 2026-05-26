@@ -90,8 +90,12 @@ class MultiScaleH264Tokenizer(nn.Module):
  
         gate_weights = torch.softmax(self.scale_gate, dim=0)   # [num_scales]  sums to 1
 
-        # Get the spatial dimensions of the residuals
-        H, W      = residuals.shape[2], residuals.shape[3]
+        # Get the spatial dimensions — fall back to MV grid when residuals are None
+        if residuals is not None:
+            H, W = residuals.shape[2], residuals.shape[3]
+        else:
+            H = motion_vectors.shape[2] * self.base_mv_scale
+            W = motion_vectors.shape[3] * self.base_mv_scale
         finest_h  = H // self.finest_scale
         finest_w  = W // self.finest_scale
 
@@ -103,9 +107,15 @@ class MultiScaleH264Tokenizer(nn.Module):
             target_h = H // scale
             target_w = W // scale
  
-            # residuals at this scale
+            # residuals at this scale — zero-fill when residuals not provided
             # Conv2d with kernel=stride=scale does non-overlapping spatial pooling
-            res_down = self.residual_downsamplers[i](residuals)     # [B, 3, H/s, W/s]
+            if residuals is not None:
+                res_down = self.residual_downsamplers[i](residuals)  # [B, 3, H/s, W/s]
+            else:
+                res_down = torch.zeros(
+                    motion_vectors.shape[0], 3, target_h, target_w,
+                    device=motion_vectors.device, dtype=motion_vectors.dtype,
+                )                                                     # [B, 3, H/s, W/s]
  
             # motion vectors resampled to this scale's grid
             # bilinear gives smoother upsampling (scale<16) and sensible downsampling (scale>16)
@@ -506,14 +516,18 @@ class ObjectDetector(nn.Module):
         iframe_mask: torch.Tensor,     # [B, T] bool, True where the frame is an I-frame
     ):
         B, T = motion_vectors.shape[:2]
-        H, W = residuals.shape[3], residuals.shape[4]
+        if residuals is not None:
+            H, W = residuals.shape[3], residuals.shape[4]
+        else:
+            H = motion_vectors.shape[3] * self.tokenizer.base_mv_scale
+            W = motion_vectors.shape[4] * self.tokenizer.base_mv_scale
         h_tokens = H // self.finest_scale
         w_tokens = W // self.finest_scale
 
         # Fold T into batch so the tokenizer runs ONE forward pass instead of T.
         # [B, T, C, H, W] -> [B*T, C, H, W]
         mv_flat  = motion_vectors.reshape(B * T, *motion_vectors.shape[2:])
-        res_flat = residuals.reshape(B * T, *residuals.shape[2:])
+        res_flat = residuals.reshape(B * T, *residuals.shape[2:]) if residuals is not None else None
 
         # Zero I-frame MVs in one vectorised mask instead of a per-frame branch.
         # Flatten order matches mv_flat/res_flat: [b0t0, b0t1, ..., b1t0, b1t1, ...].

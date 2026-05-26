@@ -17,7 +17,8 @@ model:
   num_decoder_layers: 4
 
 data:
-  npz_dir:            "dataset/"
+  npz_dir:            "/home/students/dataset_ssd"
+  sequential_io:      true
   frame_h:            64
   frame_w:            64
   clip_length:        5
@@ -26,22 +27,22 @@ data:
   use_motionvectors:  true
   use_residuals:      true
   train_ratio:        0.7
-  val_ratio:          0.3
-  test_ratio:         0.0
+  val_ratio:          0.2
+  test_ratio:         0.1
   max_files:          null
-  max_files_per_class: 500
+  max_files_per_class: 100
   target_classes:     [1, 2, 6, 9, 11]
 
 training:
   num_gpus:           1
   epochs:             300
-  batch_size:         1024
+  batch_size:         256
   seed:               42
-  num_workers:        12
-  prefetch_factor:    4
-  persistent_workers: true
+  num_workers:        4
+  prefetch_factor:    2
+  persistent_workers: false
   debug_first_batch:  false
-  lr:                 1.60e-3   # scaled: 1e-4 * (1024/64)
+  lr:                 4.0e-4   # scaled: 1e-4 * (1024/64)
   weight_decay:       1.0e-4
   grad_clip:          1.0
   scheduler:          "cosine"
@@ -54,5 +55,5 @@ loss:
   no_object_weight:   0.1
 
 paths:
-  checkpoint_dir:     "checkpoints/"
-  log_dir:            "runs/"
+  checkpoint_dir:     "/mnt/hdd/checkpoints/"
+  log_dir:            "/mnt/hdd/runs/"

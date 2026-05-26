@@ -1,12 +1,12 @@
-# config_P1E.yaml — Phase 1E: Hyperparameter search
-# batch=256, lr=1e-4 (low LR — slow but stable convergence)
+# config_P0_baseline.yaml — Phase 0: Baseline
+# Reference experiment — all later phases compared against this.
 
-experiment_name: "P1_hparam_search"
-run_name:        "P1E_batch256_lr1e-4"
+experiment_name: "P3_Input_Ablation"
+run_name:        "P3_Input_Ablation_baseline_settings_MV_ONLY"
 resume: null
 
 model:
-  num_classes:        23
+  num_classes:        23       # full YouTube-BB label space — do not change
   num_queries:        10
   scales:             [8, 16, 32]
   base_mv_scale:      16
@@ -17,7 +17,7 @@ model:
   num_decoder_layers: 4
 
 data:
-  npz_dir:            "/home/students/dataset_ssd/"
+  npz_dir:            "/home/students/dataset_ssd"
   sequential_io:      true
   frame_h:            64
   frame_w:            64
@@ -25,7 +25,7 @@ data:
   stride:             5
   snap_to_iframe:     true
   use_motionvectors:  true
-  use_residuals:      true
+  use_residuals:      false
   train_ratio:        0.7
   val_ratio:          0.2
   test_ratio:         0.1
@@ -35,18 +35,18 @@ data:
 
 training:
   num_gpus:           1
-  epochs:             100
+  epochs:             300
   batch_size:         256
   seed:               42
   num_workers:        4
   prefetch_factor:    2
   persistent_workers: false
   debug_first_batch:  false
-  lr:                 1.0e-4
+  lr:                 4.0e-4   # scaled: 1e-4 * (1024/64)
   weight_decay:       1.0e-4
   grad_clip:          1.0
   scheduler:          "cosine"
-  warmup_epochs:      5
+  warmup_epochs:      20
   early_stopping_patience: 20
 
 loss:
